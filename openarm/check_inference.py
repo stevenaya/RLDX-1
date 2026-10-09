@@ -9,6 +9,7 @@ import argparse
 from contextlib import contextmanager
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -29,16 +30,19 @@ def completed_formal_checkpoint(checkpoint):
     return completion
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("checkpoint-dir", "warmup-sample", "eval-workspace", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--rtc-mode", choices=("none", "guided"), default="none")
+    parser.add_argument("--rtc-margin-ms", type=float, default=10)
     parser.add_argument("--repeats", type=int, choices=range(2, 5), default=2)
     parser.add_argument("--timeout-seconds", type=int, default=1100)
     parser.add_argument("--readiness-seconds", type=int, default=360)
     parser.add_argument("--request-seconds", type=int, default=180)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if not math.isfinite(args.rtc_margin_ms) or args.rtc_margin_ms < 0:
+        parser.error("RTC margin must be finite nonnegative milliseconds")
     job_guard()
     if os.environ.get("MODEL_LAB_STAGE_KIND") != "none" or os.environ.get("MODEL_LAB_MAX_STEPS") != "0":
         parser.error("Inference verification requires a registered zero-update stage")
@@ -58,6 +62,14 @@ def parse_args():
         parser.error("Checkpoint lacks its save-completion marker")
     args.checkpoint_completion = completed_formal_checkpoint(args.checkpoint_dir)
     return args
+
+
+def server_command(args, socket_path):
+    """Forward the candidate margin without changing serving or lateness defaults."""
+    return [sys.executable, "-m", "openarm.serve", "--checkpoint-dir", str(args.checkpoint_dir),
+            "--socket-path", str(socket_path), "--warmup-sample", str(args.warmup_sample),
+            "--warmup-steps", "1", "--rtc-mode", args.rtc_mode,
+            "--rtc-margin-ms", str(args.rtc_margin_ms), "--rtc-max-lateness-ms", "50"]
 
 
 def arrow_input(sample, current=None):
@@ -154,6 +166,11 @@ def receipt_summary(response, received_ns):
             "takeover_timestamp_ns": takeover,
             "max_lateness_ns": tolerance,
             "deadline_timestamp_ns": deadline,
+            "observation_age_ms": (execution["inference_started_timestamp_ns"]
+                                   - execution["action_origin_timestamp_ns"]) / 1e6,
+            "inference_start_to_receipt_ms": (received_ns
+                                              - execution["inference_started_timestamp_ns"]) / 1e6,
+            "deadline_slack_ms": (deadline - received_ns) / 1e6,
             "received_by_deadline": received_ns <= deadline,
             "timing_feasible": received_ns <= deadline,
         }
@@ -198,6 +215,7 @@ def main():
             raise ValueError("Warmup cameras must be RGB uint8 HWC")
     observation, metadata = arrow_input(sample)
     evidence = {"complete": False, "checkpoint": str(args.checkpoint_dir), "rtc_mode": args.rtc_mode,
+                "rtc_margin_ms": args.rtc_margin_ms, "rtc_max_lateness_ms": 50,
                 "robot_execution": False, "dora_graph_execution": False, "seed_controlled": False,
                 "caller_scope": "SHM and Session helpers; direct requests bypass bridge pending-ACK and requires_plan admission",
                 "checks": [], "input_sha256": {key: hashlib.sha256(value.tobytes()).hexdigest() for key, value in sample.items()},
@@ -213,9 +231,8 @@ def main():
     error = None
     with tempfile.TemporaryDirectory(prefix="rldx-check-", dir="/dev/shm") as directory, log_path.open("x") as log:
         socket_path = Path(directory) / "policy.socket"
-        command = [sys.executable, "-m", "openarm.serve", "--checkpoint-dir", str(args.checkpoint_dir),
-                   "--socket-path", str(socket_path), "--warmup-sample", str(args.warmup_sample),
-                   "--warmup-steps", "1", "--rtc-mode", args.rtc_mode]
+        command = server_command(args, socket_path)
+        evidence["server_command"] = command
         process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         writer = None
         try:
@@ -240,7 +257,9 @@ def main():
                     call_start = time.monotonic()
                     response, received = exchange(io, request)
                     acknowledge_input(response, written)
-                    row = dict(receipt_summary(response, received), label=label, wall_ms=(time.monotonic() - call_start) * 1000)
+                    row = dict(receipt_summary(response, received), label=label,
+                               observation_timestamp_ns=int(local_metadata["timestamp"]),
+                               wall_ms=(time.monotonic() - call_start) * 1000)
                     evidence["checks"].append(row)
                     selected = session.complete(request, response)
                     # Simulate the caller consuming a window; no robot/Dora output.
@@ -315,6 +334,7 @@ def main():
                 acknowledge_input(response, written)
                 require_bootstrap(response, "Disconnect/reconnect", guided=args.rtc_mode == "guided")
                 evidence["checks"].append(dict(receipt_summary(response, received), label="disconnect_reconnect",
+                    observation_timestamp_ns=int(reconnect_metadata["timestamp"]),
                     wall_ms=(time.monotonic() - call_start) * 1000))
         except Exception as exc:
             error = exc

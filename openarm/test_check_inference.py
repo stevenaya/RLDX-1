@@ -3,11 +3,15 @@
 The isolated job must include the pinned caller and runtime src paths on PYTHONPATH.
 """
 import json
+from contextlib import redirect_stderr
+import io
+import os
 from pathlib import Path
 import tempfile
 import time
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 from dora_openarm_local_policy_server.session import Session
@@ -15,12 +19,72 @@ from dora_openarm_local_policy_server.shm_ring import SharedMemoryRingWriter
 from openarm_policy_runtime import ModelSession
 
 from openarm.check_inference import (
-    acknowledge_input, arrow_input, completed_formal_checkpoint, require_bootstrap, summary,
+    acknowledge_input, arrow_input, completed_formal_checkpoint, parse_args,
+    receipt_summary, require_bootstrap, server_command, summary,
 )
 from openarm.test_backend import CAMERAS, FakePolicy, OpenArmBackend, manifest
 
 
+def setUpModule():
+    import pyarrow as pa
+    pa.set_cpu_count(2)
+    pa.set_io_thread_count(2)
+
+
 class CheckInferenceTests(unittest.TestCase):
+    def test_margin_cli_forwarding_preserves_lateness_and_serving_defaults(self):
+        from openarm.serve import parse_args as parse_server
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint = root / "checkpoint"
+            checkpoint.mkdir()
+            (checkpoint / "save-completion.json").write_text(json.dumps(
+                {"complete": True, "formal": True, "optimizer_updates": 500}))
+            warmup = root / "synthetic.npz"
+            warmup.touch()  # CLI validation only; no sample/model is loaded.
+            argv = ["--checkpoint-dir", str(checkpoint), "--warmup-sample", str(warmup),
+                    "--eval-workspace", temporary, "--output", str(root / "fresh.json"),
+                    "--rtc-mode", "guided"]
+            with patch.dict(os.environ, RLDX_OUTPUT=temporary, MODEL_LAB_STAGE_KIND="none",
+                            MODEL_LAB_MAX_STEPS="0"), patch("openarm.check_inference.job_guard"):
+                for options, margin in (([], 10), (["--rtc-margin-ms", "150"], 150)):
+                    with self.subTest(margin=margin):
+                        args = parse_args(argv + options)
+                        command = server_command(args, root / "policy.socket")
+                        served = parse_server(command[3:])
+                        self.assertEqual(served.rtc_mode, "guided")
+                        self.assertEqual(served.rtc_margin_ms, margin)
+                        self.assertEqual(served.rtc_max_lateness_ms, 50)
+                        self.assertEqual(served.warmup_steps, 1)
+            default = parse_server(["--checkpoint-dir", str(checkpoint), "--warmup-steps", "0"])
+            self.assertEqual((default.rtc_mode, default.rtc_margin_ms, default.rtc_max_lateness_ms),
+                             ("none", 10, 50))
+
+    def test_invalid_margin_is_rejected_before_execution(self):
+        argv = ["--checkpoint-dir", "/checkpoint", "--warmup-sample", "/sample",
+                "--eval-workspace", "/eval", "--output", "/output"]
+        for value in ("nan", "inf", "-1"):
+            with self.subTest(value=value), redirect_stderr(io.StringIO()) as errors:
+                with self.assertRaises(SystemExit):
+                    parse_args(argv + ["--rtc-margin-ms", value])
+                self.assertIn("finite nonnegative milliseconds", errors.getvalue())
+
+    def test_guided_receipt_deadline_measurements(self):
+        response = {"positions": np.zeros((32, 16)), "interval": 33_333_333,
+                    "execution": {"action_origin_timestamp_ns": 1_000_000_000,
+                                  "inference_started_timestamp_ns": 1_010_000_000,
+                                  "takeover_timestamp_ns": 1_200_000_000,
+                                  "max_lateness_ns": 50_000_000},
+                    "log_data": {"rtc": {"used": True}}}
+        timing = receipt_summary(response, 1_250_000_000)["guided_receipt_timing"]
+        self.assertEqual(timing["observation_age_ms"], 10)
+        self.assertEqual(timing["inference_start_to_receipt_ms"], 240)
+        self.assertEqual(timing["deadline_slack_ms"], 0)
+        self.assertTrue(timing["received_by_deadline"])
+        self.assertFalse(receipt_summary(response, 1_250_000_001)
+                         ["guided_receipt_timing"]["received_by_deadline"])
+
     def test_only_completed_formal_500_marker_is_accepted(self):
         complete = {"complete": True, "formal": True, "optimizer_updates": 500}
         with tempfile.TemporaryDirectory() as temporary:

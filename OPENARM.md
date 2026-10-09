@@ -14,9 +14,12 @@ moment states at step 500, and the separately saved HF scheduler without
 additional updates, and exited with code 0.
 RNG was not restored; this does not claim bitwise continuation. Ordinary
 real-checkpoint SHM inference passed in Slurm job 12533. Guided sampling and its
-offline numerical checks ran successfully, but the measured guided handoff
-missed its timing deadline; guided mode remains experimental and is not ready
-for executor use under the tested settings. The original evidence is under
+offline numerical checks ran successfully. The original guided handoff missed
+its deadline with the default 10 ms margin; one authorized follow-up passed
+with an explicit 150 ms margin and unchanged 50 ms lateness allowance. Guided
+mode remains experimental; these short probes do not establish executor
+readiness or sustained timing. Serving defaults remain mode `none`, margin
+10 ms and lateness 50 ms. The original evidence is under
 model-lab `runs/rldx1-pillow500-20261009/`, including
 `formal-1-training-evidence.json`, `formal-1-checkpoint-500-save-completion.json`
 and `formal-reload-evidence.json`.
@@ -229,9 +232,10 @@ receipt-latency EWMA and `--rtc-margin-ms` (default 10 ms). `--rtc-max-lateness-
 nonnegative. There is no configurable ramp or compilation option.
 
 F greater than 16 skips inference explicitly; the implementation does not
-shorten measured latency to force a result. An excessive EWMA may keep skipping
-until an explicit reset/restart clears it; automatic probe-based recovery is
-not implemented. Short adopted plans hold their last target, matching executor
+shorten measured latency to force a result. An excessive EWMA may keep skipping;
+a fresh valid sample acknowledgement can update it, and an explicit
+reset/restart clears it immediately. Automatic probe-based recovery is not
+implemented. Short adopted plans hold their last target, matching executor
 behavior. Missing feedback cold-bootstraps without model-cache fallback; stale
 or mismatched-attempt feedback is skipped. Prompt/trial/attempt changes and
 reset/disconnect clear both native and helper state. Warmup uses no executor
@@ -244,9 +248,28 @@ full `[32,16]` actions. Missing/withdrawn plans, stale-plan rejection and
 reset/disconnect checks passed. However, the guided call took 321.298 ms and
 arrived **130.057 ms after its takeover timestamp**, exceeding the allowed
 50 ms lateness. Its protocol/lifecycle completion does not mean RTC timing
-passed: `inference-guided-1.json` records `timing_feasible=false`. Ordinary mode
-remains the default. Guided mode is experimental and is not executor-ready under
-these tested settings; increasing lateness to hide this result is not validated.
+passed: `inference-guided-1.json` records `timing_feasible=false`. This original
+failure remains part of the evidence.
+
+The single authorized follow-up, Slurm job 12539, used the same checkpoint and
+input hashes with explicit `--rtc-margin-ms 150` and unchanged
+`--rtc-max-lateness-ms 50`. Its first guided call took 270.220 ms and arrived
+**56.084627 ms before takeover**, leaving **106.084627 ms before the deadline**.
+The 170.834542 ms bootstrap estimate, 8.990174 ms observation age and 150 ms
+margin produced F=10, six taper steps and 16 free steps. It returned finite full
+`[32,16]` actions; missing/withdrawn plans, stale-plan rejection, reset/reconnect
+and clean shutdown checks also passed. See `inference-guided-margin150-1.json`
+and `rtc-margin-comparison.json` in the run evidence directory.
+
+The delay estimate initially comes from an unguided bootstrap, while guided
+sampling adds three VJPs. It still underestimated the new guided
+backend-start-to-receipt duration by 97.423987 ms; the explicit larger margin
+provided enough lead time for this call. The new call also ran faster, native
+RNG was uncontrolled and prefix length differed, so these receipts do not isolate a
+latency improvement caused by margin. Ordinary mode, 10 ms margin and 50 ms
+lateness remain the defaults. Guided mode remains experimental: one short
+timing pass does not establish sustained deadlines, estimator convergence or
+real executor adoption.
 
 The separate Slurm job 12535 numerical probe completed six native-sampler calls,
 including one discarded warmup, with matched RNG states and identical processed
@@ -257,9 +280,9 @@ repeatability floor. Each guided call exercised three finite VJPs; padded-channe
 residuals were zero. All calls produced finite normalized `[1,32,64]` and decoded
 `[32,16]` outputs. Peak allocated GPU memory was 17,127,150,080 bytes (about 15.95 GiB).
 See `rtc-numerics-1.json` for the recorded errors and traces. This was offline
-F=1 conditioning, without executor timestamps; it does not repair or supersede
-the failed SHM handoff timing, prove general determinism, or guarantee a frozen
-prefix or improved task quality.
+F=1 conditioning, without executor timestamps; it does not validate handoff
+timing, prove general determinism, or guarantee a frozen prefix or improved
+task quality. The two SHM timing receipts above are separate evidence.
 
 The SHM harness uses the caller's Session and SHM helpers; its direct requests
 bypass the outer bridge's pending-ACK and `requires_plan` admission. No complete
