@@ -102,6 +102,7 @@ class PolicyLoader:
         embodiment_tag: EmbodimentTag,
         model_path: str,
         device: int | str,
+        backbone_path: str | None = None,
         deactivate_memory: bool = False,
         sample_timestep_from_beta_dist: bool = False,
         denoising_timesteps: list[float] | None = None,
@@ -109,10 +110,15 @@ class PolicyLoader:
     ) -> LoaderResult:
         """Full load pipeline. See module docstring for phase summary."""
         model_dir = _resolve_model_dir(model_path)
-        model = _load_model(model_dir, device, deactivate_memory)
+        local_backbone = None
+        if backbone_path is not None:
+            local_backbone = Path(backbone_path).resolve(strict=True)
+            if not local_backbone.is_dir():
+                raise ValueError("backbone_path must be a local config/tokenizer directory")
+        model = _load_model(model_dir, device, deactivate_memory, local_backbone)
         _apply_model_tweaks(model, sample_timestep_from_beta_dist, denoising_timesteps)
 
-        processor = _load_processor(model_dir, model)
+        processor = _load_processor(model_dir, model, local_backbone)
 
         modality_configs = processor.get_modality_configs()[embodiment_tag.value]
         collate_fn = processor.collator
@@ -160,6 +166,7 @@ def _load_model(
     model_dir: Path,
     device: int | str,
     deactivate_memory: bool,
+    backbone_path: Path | None = None,
 ) -> Any:
     """Load model + optionally disable memory inference; return in eval mode."""
     config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
@@ -169,7 +176,26 @@ def _load_model(
         config.use_memory = False
         config.concat_memory = False
 
-    model = AutoModel.from_pretrained(model_dir, device_map=device, torch_dtype=torch.bfloat16)
+    local_options = {}
+    if backbone_path is not None:
+        config.model_name = str(backbone_path)
+        local_options = {
+            "config": config, "local_files_only": True,
+            "transformers_loading_kwargs": {"local_files_only": True},
+            "output_loading_info": True,
+        }
+    model = AutoModel.from_pretrained(
+        model_dir, device_map=device, torch_dtype=torch.bfloat16, **local_options
+    )
+    if backbone_path is not None:
+        model, loading_info = model
+        checked = ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")
+        issues = {key: loading_info.get(key, []) for key in checked if loading_info.get(key)}
+        if issues:
+            raise RuntimeError(f"Strict local checkpoint loading failed: {issues}")
+        model._openarm_loading_info = loading_info
+        print("[RLDXPolicy] Strict local checkpoint load: "
+              "0 missing, 0 unexpected, 0 mismatched keys, 0 errors")
     model.eval()
     return model
 
@@ -188,11 +214,19 @@ def _apply_model_tweaks(
         print(f"[Policy] Set fixed denoising timesteps: {denoising_timesteps}")
 
 
-def _load_processor(model_dir: Path, model: Any) -> BaseProcessor:
+def _load_processor(
+    model_dir: Path, model: Any, backbone_path: Path | None = None
+) -> BaseProcessor:
     """Load processor (subdir-aware) + inject physics config + image-first flag."""
     _processor_subdir = model_dir / "processor"
     _processor_path = _processor_subdir if _processor_subdir.exists() else model_dir
-    processor: BaseProcessor = AutoProcessor.from_pretrained(_processor_path)
+    local_options = {}
+    if backbone_path is not None:
+        local_options = {
+            "model_name": str(backbone_path),
+            "transformers_loading_kwargs": {"local_files_only": True},
+        }
+    processor: BaseProcessor = AutoProcessor.from_pretrained(_processor_path, **local_options)
 
     # Fallback: inject physics config from model config if processor lacks it
     if not processor.physics_keys and getattr(model.config, "physics_keys", None):

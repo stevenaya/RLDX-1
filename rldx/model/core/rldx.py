@@ -527,6 +527,7 @@ class RLDXActionModel(nn.Module):
         prefix_len = 0
         soft_mask_W = None
         postfix_target = None
+        guidance_mask = None
         if rtc.enabled_inference() and action_input is not None:
             maybe_prefix = action_input.get("action_prefix", None)
             cfg_len = int(action_input.get("rtc_prefix_len", rtc.inference_delay) or 0)
@@ -548,6 +549,18 @@ class RLDXActionModel(nn.Module):
                     prefix_len = cfg_len
                     rtc_mode = rtc.inference_mode
                     if rtc_mode == "guided":
+                        # Optional model-local executor adapter mask. Padded or
+                        # auxiliary channels must not contribute a VJP residual.
+                        # Omitting it preserves native guidance on every channel.
+                        maybe_mask = action_input.get("action_guidance_mask", None)
+                        if maybe_mask is not None:
+                            guidance_mask = torch.as_tensor(maybe_mask, device=device)
+                            if (guidance_mask.dtype != torch.bool or
+                                    tuple(guidance_mask.shape) !=
+                                    (batch_size, horizon, expected_dim)):
+                                raise ValueError(
+                                    "action_guidance_mask must be bool [B,H,action_dim]"
+                                )
                         s = rtc.inference_exec_horizon or (horizon - prefix_len)
                         soft_mask_W = compute_soft_mask_weights(
                             horizon, prefix_len, s, device=device, dtype=dtype
@@ -698,6 +711,8 @@ class RLDXActionModel(nn.Module):
                     if W_b.shape[0] == 1 and batch_size > 1:
                         W_b = W_b.expand(batch_size, -1)
                     grad_outputs = W_b.unsqueeze(-1) * (Y - a_hat.detach())
+                    if guidance_mask is not None:
+                        grad_outputs = grad_outputs * guidance_mask
                     vjp = torch.autograd.grad(
                         outputs=a_hat,
                         inputs=x_g,

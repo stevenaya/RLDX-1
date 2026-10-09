@@ -123,7 +123,16 @@ class LayerWrapper(nn.Module):
 
             hidden_states = self.left_pad_emb_list(hidden_states)
 
-            if "attention_mask" in kwargs and kwargs["attention_mask"] is not None:
+            if kwargs.get("attention_mask") is not None and kwargs["attention_mask"].ndim == 4:
+                mask = kwargs["attention_mask"]
+                if mask.shape[0] != bsz or tuple(mask.shape[-2:]) != (seq_len, seq_len):
+                    raise ValueError("4D attention masks require square uncached prefill in LayerWrapper")
+                if compress_mask.any() or motion_drop_mask.any():
+                    raise ValueError("4D attention masks support current-frame identity selection only; video/motion token compression is unsupported")
+                # One frame per view keeps every token. Preserve the complete
+                # SDPA mask (Boolean or additive), including both causal axes
+                # and padding. The legacy 2D compression path below is unchanged.
+            elif "attention_mask" in kwargs and kwargs["attention_mask"] is not None:
                 att_list = [
                     torch.cat(
                         [

@@ -235,6 +235,12 @@ class PolicyRuntime:
 
         No-op if _rtc_enabled is False.
         """
+        # Explicit model-local executor target: full normalized plan, rebased by
+        # the caller with this checkpoint's processor. Presence is authoritative,
+        # including None for bootstrap; never read or save a model-chunk cache.
+        # Other extras retain their existing ignored behavior.
+        if "executor_rtc" in request.extras:
+            return self._inject_executor_rtc(request, collated, B)
         if not self._rtc_enabled:
             return []
 
@@ -360,6 +366,37 @@ class PolicyRuntime:
             elif self.verbose:
                 print("[SERVER-LOG] RTC postfix Y target: cache miss (cold start ramp)")
         return active_sids
+
+    def _inject_executor_rtc(self, request: StepRequest, collated: dict, B: int) -> list[str]:
+        """Opt-in full normalized executor target; legacy prefix paths unchanged."""
+        if not self._rtc_enabled or self.rtc_inference_mode != "guided" or self.use_memory:
+            raise ValueError("executor_rtc requires guided RTC without memory")
+        if request.action_prefix is not None:
+            raise ValueError("executor_rtc cannot be combined with action_prefix")
+        prior = request.extras["executor_rtc"]
+        if prior is None:
+            return []  # Explicit bootstrap, even if a native cached chunk exists.
+        horizon = int(self.model.config.action_horizon)
+        dim = int(self.model.action_model.action_dim)
+        prefix = prior["prefix_len"]
+        if not isinstance(prefix, int):
+            raise ValueError("executor_rtc prefix_len must be an integer")
+        s = self.rtc_exec_horizon or (horizon - prefix)
+        if not 0 < prefix <= s <= horizon - prefix:
+            raise ValueError("executor_rtc requires 0 < prefix <= s <= H-prefix")
+        target = torch.as_tensor(prior["target"], device=self.model.device, dtype=torch.float32)
+        mask = torch.as_tensor(prior["mask"], device=self.model.device)
+        expected = (B, horizon, dim)
+        if tuple(target.shape) != expected or not torch.isfinite(target).all():
+            raise ValueError("executor_rtc target must be finite normalized [B,H,action_dim]")
+        if tuple(mask.shape) != expected or mask.dtype != torch.bool:
+            raise ValueError("executor_rtc mask must be boolean [B,H,action_dim]")
+        target = target.to(dtype=torch.bfloat16)
+        collated["action_prefix"] = target[:, :prefix].contiguous()
+        collated["action_postfix_target"] = target[:, prefix:].contiguous()
+        collated["rtc_prefix_len"] = prefix
+        collated["action_guidance_mask"] = mask
+        return []  # Suppress native RTC chunk-cache writes in step().
 
     # ------------------------------------------------------------------
     # Stage 3: run inference

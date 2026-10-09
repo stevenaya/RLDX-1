@@ -201,3 +201,6 @@ docs/claude/
 # User-local artifacts not committed to shared branches
 output_final/
 run_scripts/eval/libero/local_eval_rldx_libero.sh
+
+# OpenArm deployment artifacts remain private and outside publication.
+/deployment_assets/

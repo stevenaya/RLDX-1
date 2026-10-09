@@ -749,6 +749,9 @@ class RLDXProcessor(BaseProcessor):
             for embodiment_tag, modality_config in modality_configs.items():
                 processor_kwargs["modality_configs"][embodiment_tag] = modality_config
             override_keys = [
+                # Explicit local deployment config/tokenizer binding; keep saved
+                # normalization and modality metadata from this checkpoint.
+                "model_name",
                 "random_rotation_angle",
                 "color_jitter_params",
                 "use_relative_action",

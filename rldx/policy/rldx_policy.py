@@ -67,6 +67,7 @@ class RLDXPolicy(BasePolicy):
         model_path: str,
         *,
         device: int | str,
+        backbone_path: str | None = None,
         strict: bool = True,
         sample_timestep_from_beta_dist: bool = False,
         denoising_timesteps: list[float] | None = None,
@@ -85,6 +86,9 @@ class RLDXPolicy(BasePolicy):
             embodiment_tag: The embodiment tag defining the robot/environment type
             model_path: Path to the pretrained model checkpoint directory
             device: Device to run the model on (e.g., 'cuda:0', 0, 'cpu')
+            backbone_path: Optional local backbone config/tokenizer directory.
+                Overrides saved model_name for model and processor loading without
+                changing checkpoint normalization or downloading backbone weights.
             strict: Whether to enforce strict input validation (default: True)
             rtc_inference_mode / rtc_inference_delay / rtc_inference_exec_horizon /
                 rtc_jacobian_beta / rtc_jacobian_steps_only:
@@ -110,6 +114,7 @@ class RLDXPolicy(BasePolicy):
             embodiment_tag=embodiment_tag,
             model_path=model_path,
             device=device,
+            backbone_path=backbone_path,
             deactivate_memory=deactivate_memory,
             sample_timestep_from_beta_dist=sample_timestep_from_beta_dist,
             denoising_timesteps=denoising_timesteps,
