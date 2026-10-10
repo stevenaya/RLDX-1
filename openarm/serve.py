@@ -25,13 +25,21 @@ def parse_args(argv=None):
     parser.add_argument("--warmup-sample", type=Path)
     parser.add_argument("--warmup-steps", type=int, default=1)
     parser.add_argument("--prompt", default="")
-    parser.add_argument("--rtc-mode", choices=("none", "guided", "trained", "executor"), default="none")
+    parser.add_argument("--rtc-mode", choices=("none", "guided", "inpaint", "trained", "executor"), default="none")
+    parser.add_argument("--rtc-guidance-steps", type=int, choices=range(1, 5), default=None,
+                        help="Guided VJP steps out of this checkpoint's four denoising steps; default uses checkpoint setting")
+    parser.add_argument("--rtc-inpaint-ramp-steps", type=int, choices=range(32), default=0,
+                        help="Inpaint linear update-strength ramp after frozen prefix; first ramp step is also frozen")
     parser.add_argument("--rtc-margin-ms", type=float, default=10)
     parser.add_argument("--rtc-max-lateness-ms", type=float, default=50)
     parser.add_argument("--dry-run", action="store_true", help="Check local metadata only; no model load")
     args = parser.parse_args(argv)
-    if args.rtc_mode not in ("none", "guided"):
-        parser.error("Only none and experimental guided RTC are supported; trained/executor modes are unsupported")
+    if args.rtc_mode not in ("none", "guided", "inpaint"):
+        parser.error("Only none, guided and inpaint are supported; trained/executor modes are unsupported")
+    if args.rtc_guidance_steps is not None and args.rtc_mode != "guided":
+        parser.error("--rtc-guidance-steps requires guided mode")
+    if args.rtc_inpaint_ramp_steps and args.rtc_mode != "inpaint":
+        parser.error("--rtc-inpaint-ramp-steps requires inpaint mode")
     if any(not math.isfinite(value) or value < 0 for value in (args.rtc_margin_ms, args.rtc_max_lateness_ms)):
         parser.error("RTC margin and maximum lateness must be finite nonnegative milliseconds")
     if args.warmup_steps < 0 or (args.warmup_steps and args.warmup_sample is None):
@@ -90,8 +98,10 @@ def main(argv=None):
     from openarm.backend import OpenArmBackend
     from openarm_policy_runtime import ModelSession, serve
 
-    rtc_options = {"rtc_inference_mode": args.rtc_mode}
-    if args.rtc_mode == "guided":
+    # The native policy enables executor-prior plumbing under guided. The
+    # per-request option selects the actual guided or gradient-free sampler.
+    rtc_options = {"rtc_inference_mode": "none" if args.rtc_mode == "none" else "guided"}
+    if args.rtc_mode != "none":
         rtc_options.update(rtc_inference_delay=1, rtc_inference_exec_horizon=16)
     policy = RLDXPolicy(
         embodiment_tag=EmbodimentTag.GENERAL_EMBODIMENT,
@@ -100,14 +110,18 @@ def main(argv=None):
         **rtc_options,
     )
     rtc = None
-    if args.rtc_mode == "guided":
+    if args.rtc_mode != "none":
         from openarm.rtc import ExecutionRTC
-        rtc = ExecutionRTC(policy, margin_ms=args.rtc_margin_ms,
+        rtc = ExecutionRTC(policy, mode=args.rtc_mode, guidance_steps=args.rtc_guidance_steps,
+                           inpaint_ramp_steps=args.rtc_inpaint_ramp_steps, margin_ms=args.rtc_margin_ms,
                            max_lateness_ms=args.rtc_max_lateness_ms)
     backend = OpenArmBackend(policy, manifest, warmup_sample=args.warmup_sample,
                              warmup_steps=args.warmup_steps, prompt=args.prompt, rtc=rtc)
     try:
         backend.warmup()  # Ping readiness becomes available only after this completes.
+        logging.info("Warmup paths: %s", json.dumps(backend.warmup_trace))
+        if rtc is not None:
+            logging.info("Mode latency calibration ms: %s", json.dumps(rtc.latency_snapshot()))
         serve(args.socket_path, lambda: ModelSession(backend), listen=args.local_server)
     finally:
         backend.close()

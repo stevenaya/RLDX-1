@@ -34,8 +34,11 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("checkpoint-dir", "warmup-sample", "eval-workspace", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
-    parser.add_argument("--rtc-mode", choices=("none", "guided"), default="none")
+    parser.add_argument("--rtc-mode", choices=("none", "guided", "inpaint"), default="none")
     parser.add_argument("--rtc-margin-ms", type=float, default=10)
+    parser.add_argument("--rtc-guidance-steps", type=int, choices=range(1, 5), default=None)
+    parser.add_argument("--rtc-inpaint-ramp-steps", type=int, choices=range(32), default=0)
+    parser.add_argument("--warmup-steps", type=int, choices=range(1, 9), default=1)
     parser.add_argument("--repeats", type=int, choices=range(2, 5), default=2)
     parser.add_argument("--timeout-seconds", type=int, default=1100)
     parser.add_argument("--readiness-seconds", type=int, default=360)
@@ -43,6 +46,10 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if not math.isfinite(args.rtc_margin_ms) or args.rtc_margin_ms < 0:
         parser.error("RTC margin must be finite nonnegative milliseconds")
+    if args.rtc_guidance_steps is not None and args.rtc_mode != "guided":
+        parser.error("--rtc-guidance-steps requires guided mode")
+    if args.rtc_inpaint_ramp_steps and args.rtc_mode != "inpaint":
+        parser.error("--rtc-inpaint-ramp-steps requires inpaint mode")
     job_guard()
     if os.environ.get("MODEL_LAB_STAGE_KIND") != "none" or os.environ.get("MODEL_LAB_MAX_STEPS") != "0":
         parser.error("Inference verification requires a registered zero-update stage")
@@ -66,10 +73,15 @@ def parse_args(argv=None):
 
 def server_command(args, socket_path):
     """Forward the candidate margin without changing serving or lateness defaults."""
-    return [sys.executable, "-m", "openarm.serve", "--checkpoint-dir", str(args.checkpoint_dir),
+    command = [sys.executable, "-m", "openarm.serve", "--checkpoint-dir", str(args.checkpoint_dir),
             "--socket-path", str(socket_path), "--warmup-sample", str(args.warmup_sample),
-            "--warmup-steps", "1", "--rtc-mode", args.rtc_mode,
+            "--warmup-steps", str(args.warmup_steps), "--rtc-mode", args.rtc_mode,
             "--rtc-margin-ms", str(args.rtc_margin_ms), "--rtc-max-lateness-ms", "50"]
+    if args.rtc_guidance_steps is not None:
+        command += ["--rtc-guidance-steps", str(args.rtc_guidance_steps)]
+    if args.rtc_mode == "inpaint":
+        command += ["--rtc-inpaint-ramp-steps", str(args.rtc_inpaint_ramp_steps)]
+    return command
 
 
 def arrow_input(sample, current=None):
@@ -160,7 +172,7 @@ def receipt_summary(response, received_ns):
     if used and not response.get("prefill") and takeover > 0:
         tolerance = int(execution["max_lateness_ns"])
         deadline = takeover + tolerance
-        result["guided_receipt_timing"] = {
+        result["rtc_receipt_timing"] = {
             "scope": "timing_only; excludes outer bridge pending-ACK/admission and executor adoption",
             "receipt_minus_takeover_ms": (received_ns - takeover) / 1e6,
             "takeover_timestamp_ns": takeover,
@@ -174,6 +186,8 @@ def receipt_summary(response, received_ns):
             "received_by_deadline": received_ns <= deadline,
             "timing_feasible": received_ns <= deadline,
         }
+        if response.get("log_data", {}).get("rtc", {}).get("mode", "guided") == "guided":
+            result["guided_receipt_timing"] = result["rtc_receipt_timing"]
     # Lateness is evidence, not a failure of finite-output/VJP validation.
     return result
 
@@ -216,6 +230,8 @@ def main():
     observation, metadata = arrow_input(sample)
     evidence = {"complete": False, "checkpoint": str(args.checkpoint_dir), "rtc_mode": args.rtc_mode,
                 "rtc_margin_ms": args.rtc_margin_ms, "rtc_max_lateness_ms": 50,
+                "rtc_guidance_steps": args.rtc_guidance_steps,
+                "rtc_inpaint_ramp_steps": args.rtc_inpaint_ramp_steps, "warmup_steps": args.warmup_steps,
                 "robot_execution": False, "dora_graph_execution": False, "seed_controlled": False,
                 "caller_scope": "SHM and Session helpers; direct requests bypass bridge pending-ACK and requires_plan admission",
                 "checks": [], "input_sha256": {key: hashlib.sha256(value.tobytes()).hexdigest() for key, value in sample.items()},
@@ -280,7 +296,7 @@ def main():
                 evidence["repeat_max_absolute_differences"] = [float(np.max(np.abs(value - repeated[0]))) for value in repeated[1:]]
                 evidence["repeat_interpretation"] = "identical recorded state/images/prompt; native RNG uncontrolled, differences are not a determinism failure"
 
-                if args.rtc_mode == "guided":
+                if args.rtc_mode != "none":
                     inferred_start = first_response["execution"]["inference_started_timestamp_ns"]
                     plan = {"chunk_id": "simulated-adopted-" + first_request["chunk_id"],
                             "sample_chunk_id": first_request["chunk_id"], "start_timestamp_ns": first_received,
@@ -291,28 +307,34 @@ def main():
                     current = sample["qpos"].copy()
                     current[:7] += .001
                     current[8:15] -= .001
-                    _, guided, _, _ = predict("guided_adopted_plan_current_state_rebase", plan=plan, current=current)
+                    _, guided, _, _ = predict(args.rtc_mode + "_adopted_plan_current_state_rebase", plan=plan, current=current)
                     rtc = guided.get("log_data", {}).get("rtc", {})
-                    evidence["guided_model_exercised"] = bool(rtc.get("used")) and not guided.get("prefill")
+                    active = bool(rtc.get("used")) and not guided.get("prefill")
+                    sampler = rtc.get("sampler", {})
+                    if active and (sampler.get("effective_mode") != args.rtc_mode
+                                   or (sampler.get("vjp_calls", 0) > 0) != (args.rtc_mode == "guided")):
+                        raise AssertionError("Actual sampler trace does not match requested active RTC path")
+                    evidence["active_model_exercised"] = active
+                    evidence[args.rtc_mode + "_model_exercised"] = active
                     evidence["executor_plan_scope"] = "simulated offline adoption of caller-selected two-step window, measured inference/receipt timestamps; endpoint hold follows executor semantics"
                     if rtc.get("used") and guided["execution"]["based_on_chunk_id"] != plan["chunk_id"]:
                         raise AssertionError("Guidance is not based on the supplied adopted plan")
-                    _, missing, _, _ = predict("guided_missing_plan_no_cache")
+                    _, missing, _, _ = predict(args.rtc_mode + "_missing_plan_no_cache")
                     require_bootstrap(missing, "Missing executor feedback", guided=True)
-                    _, withdrawn, _, _ = predict("guided_withdrawn_plan_no_cache",
+                    _, withdrawn, _, _ = predict(args.rtc_mode + "_withdrawn_plan_no_cache",
                         plan={"chunk_id": "", "positions": []})
                     require_bootstrap(withdrawn, "Withdrawn executor feedback", guided=True)
                     if withdrawn["log_data"]["rtc"].get("reason") != "no_adopted_plan":
                         raise AssertionError("Withdrawn executor feedback was not recognized")
                     stale = dict(plan, inference_started_timestamp_ns=inferred_start - 1)
-                    _, rejected, _, _ = predict("guided_stale_plan_rejected", plan=stale)
+                    _, rejected, _, _ = predict(args.rtc_mode + "_stale_plan_rejected", plan=stale)
                     if not rejected.get("prefill") or rejected.get("execution") is not None:
                         raise AssertionError("Stale executor plan was not rejected without commands")
 
                 _, reset_response, _, _ = predict("explicit_trial_reset", trial="checkpoint-smoke-reset", reset="trial")
                 if reset_response.get("reset_applied") is not True:
                     raise AssertionError("Explicit reset was not acknowledged")
-                require_bootstrap(reset_response, "Explicit reset", guided=args.rtc_mode == "guided")
+                require_bootstrap(reset_response, "Explicit reset", guided=args.rtc_mode != "none")
                 session.close()
             # Disconnect must reset backend state while leaving the listener reusable.
             writer.close()
@@ -327,12 +349,12 @@ def main():
                 written = writer.write(observation, reconnect_metadata)
                 request = dict(transport="shm_ring_v1", shm=written.descriptor, metadata=reconnect_metadata,
                                chunk_id="reconnect", record_log=True, prompt=str(sample["prompt"].item()))
-                if args.rtc_mode == "guided":
+                if args.rtc_mode != "none":
                     request["execution_plan"] = plan
                 call_start = time.monotonic()
                 response, received = exchange(io, request)
                 acknowledge_input(response, written)
-                require_bootstrap(response, "Disconnect/reconnect", guided=args.rtc_mode == "guided")
+                require_bootstrap(response, "Disconnect/reconnect", guided=args.rtc_mode != "none")
                 evidence["checks"].append(dict(receipt_summary(response, received), label="disconnect_reconnect",
                     observation_timestamp_ns=int(reconnect_metadata["timestamp"]),
                     wall_ms=(time.monotonic() - call_start) * 1000))

@@ -26,7 +26,9 @@ from openarm.test_backend import CAMERAS, FakePolicy, OpenArmBackend, manifest
 
 
 def setUpModule():
+    import cv2
     import pyarrow as pa
+    cv2.setNumThreads(2)
     pa.set_cpu_count(2)
     pa.set_io_thread_count(2)
 
@@ -61,6 +63,43 @@ class CheckInferenceTests(unittest.TestCase):
             self.assertEqual((default.rtc_mode, default.rtc_margin_ms, default.rtc_max_lateness_ms),
                              ("none", 10, 50))
 
+    def test_active_mode_controls_forward_to_server_without_changing_defaults(self):
+        from openarm.serve import parse_args as parse_server
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint = root / "checkpoint"
+            checkpoint.mkdir()
+            (checkpoint / "save-completion.json").write_text(json.dumps(
+                {"complete": True, "formal": True, "optimizer_updates": 500}))
+            sample = root / "sample.npz"
+            sample.touch()
+            argv = ["--checkpoint-dir", str(checkpoint), "--warmup-sample", str(sample),
+                    "--eval-workspace", temporary, "--output", str(root / "fresh.json"),
+                    "--warmup-steps", "2"]
+            with patch.dict(os.environ, RLDX_OUTPUT=temporary, MODEL_LAB_STAGE_KIND="none",
+                            MODEL_LAB_MAX_STEPS="0"), patch("openarm.check_inference.job_guard"):
+                for mode, control, value in (("guided", "rtc-guidance-steps", 1),
+                                             ("guided", "rtc-guidance-steps", 4),
+                                             ("inpaint", "rtc-inpaint-ramp-steps", 12)):
+                    with self.subTest(mode=mode, value=value):
+                        args = parse_args(argv + ["--rtc-mode", mode, "--" + control, str(value)])
+                        served = parse_server(server_command(args, root / "socket")[3:])
+                        self.assertEqual(served.rtc_mode, mode)
+                        self.assertEqual(getattr(served, control.replace("-", "_")), value)
+                        self.assertEqual(served.warmup_steps, 2)
+                        self.assertEqual((served.rtc_margin_ms, served.rtc_max_lateness_ms), (10, 50))
+
+    def test_cross_mode_controls_are_rejected_before_execution(self):
+        argv = ["--checkpoint-dir", "/checkpoint", "--warmup-sample", "/sample",
+                "--eval-workspace", "/eval", "--output", "/output"]
+        for options in (["--rtc-mode", "inpaint", "--rtc-guidance-steps", "1"],
+                        ["--rtc-mode", "guided", "--rtc-inpaint-ramp-steps", "12"],
+                        ["--rtc-mode", "none", "--rtc-guidance-steps", "3"]):
+            with self.subTest(options=options), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    parse_args(argv + options)
+
     def test_invalid_margin_is_rejected_before_execution(self):
         argv = ["--checkpoint-dir", "/checkpoint", "--warmup-sample", "/sample",
                 "--eval-workspace", "/eval", "--output", "/output"]
@@ -84,6 +123,10 @@ class CheckInferenceTests(unittest.TestCase):
         self.assertTrue(timing["received_by_deadline"])
         self.assertFalse(receipt_summary(response, 1_250_000_001)
                          ["guided_receipt_timing"]["received_by_deadline"])
+        response["log_data"]["rtc"]["mode"] = "inpaint"
+        inpaint = receipt_summary(response, 1_250_000_000)
+        self.assertEqual(inpaint["rtc_receipt_timing"], timing)
+        self.assertNotIn("guided_receipt_timing", inpaint)
 
     def test_only_completed_formal_500_marker_is_accepted(self):
         complete = {"complete": True, "formal": True, "optimizer_updates": 500}

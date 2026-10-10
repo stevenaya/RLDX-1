@@ -44,7 +44,9 @@ def policy_with_processor(sap=None):
                                    use_relative_action=True, clip_outliers=True)
     return NS(embodiment_tag=EmbodimentTag.GENERAL_EMBODIMENT,
               processor=NS(state_action_processor=sap),
-              model=NS(action_model=NS(action_dim=64), config=NS(action_horizon=32)),
+              model=NS(action_model=NS(action_dim=64, num_inference_timesteps=4,
+                                      _rtc=NS(jacobian_steps_only=3)),
+                       device="cpu", config=NS(action_horizon=32)),
               rtc_inference_mode="guided", rtc_inference_delay=1, rtc_exec_horizon=16)
 
 
@@ -122,16 +124,60 @@ class PriorCodecTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not invertible"):
             PriorCodec(policy).encode(np.zeros((32, 16)), np.zeros(16))
 
+    def test_inpaint_rejects_changed_state_clipping_and_checks_zero_ramp_point(self):
+        codec = PriorCodec(policy_with_processor())
+        absolute, current = np.zeros((32, 16), np.float32), np.zeros(16, np.float32)
+        target, _ = codec.encode(absolute, current)
+        codec.validate_inpaint(target, current, 3, 2)
+        current[:7] = 10
+        changed, _ = codec.encode(absolute, current)
+        with self.assertRaisesRegex(ValueError, "outside native decoder"):
+            codec.validate_inpaint(changed, current, 3, 2)
+        target[0, 3, 0] = 1.01  # Ramp strength starts at zero, so this is frozen too.
+        with self.assertRaisesRegex(ValueError, "outside native decoder"):
+            codec.validate_inpaint(target, np.zeros(16), 3, 2)
+        codec.validate_inpaint(target, np.zeros(16), 3, 0)  # Nonfrozen postfix is not a preservation claim.
+
+    def test_inpaint_native_decoded_bf16_quantization_is_not_exact_absolute_equality(self):
+        codec = PriorCodec(policy_with_processor())
+        current = np.linspace(-.3, .4, 16, dtype=np.float32)
+        normalized = np.full((1, 32, 64), .123456, np.float32)
+        absolute = codec.decode_unclipped(normalized, current)
+        target, _ = codec.encode(absolute, current)
+        codec.validate_inpaint(target, current, 4, 3)
+        bf16 = torch.from_numpy(target).bfloat16().float().numpy()
+        quantized = codec.decode_unclipped(bf16, current)
+        self.assertGreater(float(np.abs(quantized-absolute).max()), 0)
+        self.assertLessEqual(float(np.abs(bf16[..., :16]-target[..., :16]).max()), 1/512)
+        for key, section in zip(GROUPS, SLICES):
+            params = codec.sap.norm_params[codec.tag]["action"][key]
+            span = np.asarray(params["max"])-np.asarray(params["min"])
+            self.assertTrue((np.abs(quantized[:, section]-absolute[:, section]) <= span/1024+2e-5).all())
+
 
 class TimelineTests(unittest.TestCase):
     origin = 10_000_000_000
 
-    def ready(self):
-        rtc = ExecutionRTC(policy_with_processor(), margin_ms=0)
+    def ready(self, *, calibrated=True, mode="guided"):
+        rtc = ExecutionRTC(policy_with_processor(), mode=mode, margin_ms=0)
         bootstrap = rtc.prepare(observation(self.origin), self.origin)
         self.assertEqual(bootstrap.options, {"executor_rtc": None})
         self.assertEqual(bootstrap.execution["based_on_chunk_id"], "")
+        if calibrated:
+            rtc.seed_calibration(rtc.active_key, [1])  # Explicit fixture; never ordinary feedback.
+        self.track(rtc, plan(self.origin))
         return rtc
+
+    def track(self, rtc, source, mode="none"):
+        sample_id = source["sample_chunk_id"]
+        if sample_id in rtc.pending or sample_id in rtc.acknowledged:
+            return
+        obs = observation(source["inference_started_timestamp_ns"])
+        obs.metadata["chunk_id"] = sample_id
+        trace = dict(effective_mode=mode, denoising_steps=4,
+                     vjp_calls=rtc.guidance_steps if mode=="guided" else 0)
+        rtc.record_prediction(obs, source["inference_started_timestamp_ns"],
+                              source["received_timestamp_ns"]-source["inference_started_timestamp_ns"], trace, mode)
 
     def test_alignment_short_plan_hold_and_owned_snapshot(self):
         rtc = self.ready()
@@ -155,6 +201,7 @@ class TimelineTests(unittest.TestCase):
         second = plan(stamp+2*INTERVAL_NS, chunk="chunk-2", sample_start=stamp,
                       received=stamp+INTERVAL_NS)
         second["positions"] = (np.asarray(second["positions"])+.5).tolist()
+        self.track(rtc, second)
         result = rtc.prepare(observation(stamp+INTERVAL_NS, second), stamp+INTERVAL_NS)
         decoded = rtc.codec.decode_unclipped(result.options["executor_rtc"]["target"], np.zeros(16))
         np.testing.assert_allclose(decoded[0], .02, atol=1e-7)
@@ -184,6 +231,7 @@ class TimelineTests(unittest.TestCase):
         rtc = self.ready()
         stamp = self.origin+INTERVAL_NS
         latest = plan(self.origin, chunk="latest")
+        self.track(rtc, latest)
         rtc.prepare(observation(stamp, latest), stamp)
         old = plan(self.origin, chunk="old", received=self.origin+1)
         self.assertEqual(rtc.prepare(observation(stamp, old), stamp).log_data["reason"], "superseded_plan")
@@ -204,7 +252,7 @@ class TimelineTests(unittest.TestCase):
             rtc.prepare(observation(stamp, latest), stamp)
 
     def test_sample_identity_required_and_delay_skip_logs_measured_latency(self):
-        rtc = self.ready()
+        rtc = self.ready(calibrated=False)
         stamp = self.origin+INTERVAL_NS
         for sample_id in (None, "", 123):
             source = plan(self.origin)
@@ -214,7 +262,8 @@ class TimelineTests(unittest.TestCase):
             self.assertEqual(result.log_data["reason"], "missing_sample_identity")
             self.assertEqual(rtc.delay_ns, 0)
         slow_stamp = self.origin+17*INTERVAL_NS
-        slow = plan(self.origin, received=slow_stamp)
+        slow = plan(self.origin, chunk="slow-guided", received=slow_stamp)
+        self.track(rtc, slow, mode="guided")
         result = rtc.prepare(observation(slow_stamp, slow), slow_stamp)
         self.assertTrue(result.skip)
         self.assertEqual(result.log_data["reason"], "delay_exceeds_native_guided_limit")
@@ -225,12 +274,14 @@ class TimelineTests(unittest.TestCase):
         stamp = self.origin+INTERVAL_NS
         rtc.prepare(observation(stamp, plan(self.origin)), stamp)
         second = plan(stamp, chunk="second", sample_start=stamp, received=stamp+INTERVAL_NS)
+        self.track(rtc, second)
         rtc.prepare(observation(stamp+INTERVAL_NS, second), stamp+INTERVAL_NS)
         self.assertIsNotNone(rtc.plan)
         self.assertIsNotNone(rtc.previous_plan)
         stamp += 2*INTERVAL_NS
         rejected = dict(chunk_id="", positions=[], sample_chunk_id="rejected",
                         inference_started_timestamp_ns=stamp-INTERVAL_NS, received_timestamp_ns=stamp)
+        self.track(rtc, rejected)
         result = rtc.prepare(observation(stamp, rejected), stamp)
         self.assertFalse(result.skip)
         self.assertEqual(result.options, {"executor_rtc": None})
@@ -239,8 +290,112 @@ class TimelineTests(unittest.TestCase):
         self.assertIsNone(rtc.plan)
         self.assertIsNone(rtc.previous_plan)
         future = plan(stamp+INTERVAL_NS, chunk="future", sample_start=stamp-INTERVAL_NS, received=stamp)
+        self.track(rtc, future)
         self.assertEqual(rtc.prepare(observation(stamp, future), stamp).log_data["reason"],
                          "missing_pre_handoff_coverage")
+
+    def test_latency_attribution_duplicates_unknown_and_reset_preserves_calibration(self):
+        rtc = self.ready()
+        active = rtc.path_key(observation(self.origin), "guided")
+        rtc.seed_calibration(active, [250_000_000])
+        stamp = self.origin+INTERVAL_NS
+        result = rtc.prepare(observation(stamp, plan(self.origin)), stamp)
+        self.assertEqual(result.log_data["delay_ms"], 250)
+        self.assertEqual(rtc.latencies_ns[active], 250_000_000)  # Ordinary feedback stays ordinary.
+        ordinary = rtc.path_key(observation(self.origin), "none")
+        self.assertEqual(rtc.latencies_ns[ordinary], INTERVAL_NS)
+        rtc.prepare(observation(stamp, plan(self.origin)), stamp)
+        self.assertEqual(rtc.latencies_ns[ordinary], INTERVAL_NS)
+        newer = plan(stamp, chunk="guided-new", sample_start=stamp, received=stamp+300_000_000)
+        self.track(rtc, newer, "guided")
+        rtc.prepare(observation(stamp+300_000_000, newer), stamp+300_000_000)
+        self.assertEqual(rtc.latencies_ns[active], 255_000_000)
+        unknown = dict(newer, sample_chunk_id="never-produced")
+        self.assertEqual(rtc.prepare(observation(stamp+300_000_000, unknown), stamp+300_000_000).log_data["reason"],
+                         "untracked_sample_identity")
+        before = rtc.latency_snapshot()
+        rtc.reset()
+        self.assertEqual(rtc.latency_snapshot(), before)
+        self.assertFalse(rtc.pending or rtc.acknowledged)
+        self.assertIsNone(rtc.context)
+        rtc.prepare(observation(stamp+400_000_000), stamp+400_000_000)
+        self.assertEqual(rtc.prepare(observation(stamp+400_000_001, newer), stamp+400_000_001).log_data["reason"],
+                         "stale_or_invalid_plan_timing")
+        rtc.reset(clear_calibration=True)
+        self.assertEqual(rtc.latency_snapshot(), {})
+
+    def test_keys_and_pending_state_are_bounded_and_match_effective_settings(self):
+        rtc = self.ready()
+        obs = observation(self.origin)
+        key = rtc.path_key(obs, "guided")
+        alternative = ExecutionRTC(policy_with_processor(), guidance_steps=1)
+        self.assertNotEqual(key, alternative.path_key(obs, "guided"))
+        inpaint = ExecutionRTC(policy_with_processor(), mode="inpaint", inpaint_ramp_steps=2)
+        self.assertNotEqual(key, inpaint.path_key(obs, "inpaint"))
+        for i in range(100):
+            source = plan(self.origin+i+1, chunk=f"pending-{i}")
+            self.track(rtc, source)
+            rtc.seed_calibration(str(i), [100+i])
+        self.assertEqual(len(rtc.pending), rtc.MAX_SAMPLES)
+        self.assertEqual(len(rtc.latencies_ns), rtc.MAX_CALIBRATIONS)
+        source = plan(self.origin+1, chunk="pending-0")
+        stamp = self.origin+2*INTERVAL_NS
+        self.assertEqual(rtc.prepare(observation(stamp, source), stamp).log_data["reason"], "untracked_sample_identity")
+
+    def test_live_key_miss_skips_and_only_explicit_calibration_path_can_run(self):
+        for mode in ("guided", "inpaint"):
+            rtc = self.ready(calibrated=False, mode=mode)
+            stamp = self.origin+INTERVAL_NS
+            obs = observation(stamp, plan(self.origin))
+            result = rtc.prepare(obs, stamp)
+            self.assertTrue(result.skip)
+            self.assertIsNone(result.execution)
+            self.assertIsNone(result.log_data["delay_ms"])
+            self.assertEqual(result.log_data["reason"], "latency_uncalibrated")
+            self.assertFalse(result.log_data["calibrated"] or result.log_data["calibration_only"])
+            self.assertNotIn(rtc.active_key, rtc.latencies_ns)
+            self.assertIn(rtc.path_key(obs, "none"), rtc.latencies_ns)
+            self.assertIsNone(rtc.plan)
+            warmup = rtc.prepare(obs, stamp, calibration_only=True)
+            self.assertFalse(warmup.skip)
+            self.assertTrue(warmup.log_data["used"] and warmup.log_data["calibration_only"])
+            self.assertIsNone(warmup.log_data["delay_ms"])
+            self.assertEqual(rtc.prepare(obs, stamp).log_data["reason"], "latency_uncalibrated")
+            rtc.seed_calibration(rtc.active_key, [1_000_000])
+            self.assertTrue(rtc.prepare(obs, stamp).log_data["used"])
+
+    def test_changed_camera_shape_requires_matching_active_calibration(self):
+        rtc = self.ready()
+        stamp = self.origin+INTERVAL_NS
+        obs = observation(stamp, plan(self.origin))
+        obs.cameras["camera_head_left"] = np.zeros((1, 8, 12, 3), dtype=np.uint8)
+        result = rtc.prepare(obs, stamp)
+        self.assertEqual(result.log_data["reason"], "latency_uncalibrated")
+        self.assertTrue(result.skip)
+        self.assertIsNone(result.execution)
+        self.assertIsNone(result.log_data["delay_ms"])
+        rtc.seed_calibration(rtc.path_key(obs, "none"), [100_000_000])
+        self.assertEqual(rtc.prepare(obs, stamp).log_data["reason"], "latency_uncalibrated")
+        rtc.seed_calibration(rtc.active_key, [1_000_000])
+        self.assertTrue(rtc.prepare(obs, stamp).log_data["used"])
+
+    def test_inpaint_dispatch_and_unpreservable_changed_state_skip(self):
+        rtc = ExecutionRTC(policy_with_processor(), mode="inpaint", inpaint_ramp_steps=2, margin_ms=0)
+        rtc.prepare(observation(self.origin), self.origin)
+        rtc.seed_calibration(rtc.active_key, [1])
+        source = plan(self.origin, count=2)
+        self.track(rtc, source)
+        stamp = self.origin+INTERVAL_NS
+        result = rtc.prepare(observation(stamp, source), stamp)
+        self.assertEqual(result.options["executor_rtc"]["mode"], "inpaint")
+        self.assertEqual(result.options["executor_rtc"]["ramp_steps"], 2)
+        self.assertTrue(result.log_data["hard_prefix"])
+        changed = observation(stamp+1, source)
+        changed.qpos[0, :7] = 10
+        rejected = rtc.prepare(changed, stamp+1)
+        self.assertTrue(rejected.skip)
+        self.assertEqual(rejected.log_data["reason"], "inpaint_prior_not_preservable")
+        self.assertIsNone(rejected.execution)
 
 
 class NativeRuntimeTests(unittest.TestCase):

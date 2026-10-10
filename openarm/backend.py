@@ -18,14 +18,14 @@ DIMS = (7, 1, 7, 1)
 HORIZON = 32
 INTERVAL_NS = 33_333_333  # 30 Hz targets, independent of inference request rate.
 RTC_REASON = (
-    "Only none and experimental guided RTC are supported. Trained RTC requires "
+    "Only none and experimental guided/inpaint RTC are supported. Trained RTC requires "
     "matching rtc_training_max_delay training and numerical validation; executor "
     "is a feedback source, not a native RLDX sampling mode."
 )
 
 
 def require_supported_rtc(mode):
-    if mode not in ("none", "guided"):
+    if mode not in ("none", "guided", "inpaint"):
         raise ValueError(RTC_REASON)
 
 
@@ -58,7 +58,7 @@ def validate_policy(policy, rtc=None):
         raise ValueError("Checkpoint requires unsupported auxiliary inputs")
     require_supported_rtc(policy.rtc_inference_mode)
     if policy.rtc_inference_mode != ("guided" if rtc is not None else "none"):
-        raise ValueError("Guided mode requires the explicit executor RTC adapter")
+        raise ValueError("Active modes require the explicit executor RTC adapter with native guided configuration")
     modalities = policy.modality_configs
     for name, keys, offsets in (
         ("video", CAMERAS, [0]), ("state", GROUPS, [0]),
@@ -102,26 +102,63 @@ class OpenArmBackend(Backend):
         self.warmup_steps = warmup_steps
         self.prompt = prompt
         self.rtc = rtc
+        self.warmup_trace = []
+        self.warmup_evidence = self.warmup_trace
 
     def warmup(self):
         if not self.warmup_steps:
             return
+        self.warmup_trace.clear()
+        durations = {}
         try:
             with np.load(self.warmup_sample, allow_pickle=False) as sample:
                 prompt = str(sample["prompt"].item()) if "prompt" in sample else self.prompt
-                observation = Observation(
-                    timestamp=time.time_ns(), qpos=sample["qpos"].copy()[None],
-                    cameras={key: sample[key].copy()[None] for key in self.camera_fields},
-                    prompt=prompt, delta_indices=(0,),
-                )
-            for _ in range(self.warmup_steps):
-                self.predict(observation)  # Discard; never send synthetic actions to an executor.
+                qpos = sample["qpos"].copy()[None]
+                cameras = {key: sample[key].copy()[None] for key in self.camera_fields}
+            for index in range(self.warmup_steps):
+                observation = Observation(time.time_ns(), qpos, cameras, prompt, delta_indices=(0,),
+                    metadata={"chunk_id": f"warmup-bootstrap-{index}",
+                              "inference_trial_id": "local-warmup", "episode_attempt_id": "local-warmup"})
+                bootstrap = self.predict(observation)
+                rows = [bootstrap.log_data["rtc"]["sampler"]]
+                if self.rtc is not None:
+                    received = time.time_ns()
+                    origin = time.time_ns()
+                    # Native statistical centers form an in-range local simulated
+                    # plan, using the recorded raw state; no hardware command/ACK.
+                    normalized = np.zeros((1, HORIZON, self.rtc.codec.dim), np.float32)
+                    prior = self.rtc.codec.decode_unclipped(normalized, qpos[0])
+                    plan = dict(chunk_id=f"warmup-plan-{index}", positions=prior.tolist(),
+                                start_timestamp_ns=origin, interval_ns=INTERVAL_NS,
+                                sample_chunk_id=observation.metadata["chunk_id"],
+                                inference_started_timestamp_ns=bootstrap.execution["inference_started_timestamp_ns"],
+                                received_timestamp_ns=received, episode_attempt_id="local-warmup")
+                    active = Observation(origin, qpos, cameras, prompt, delta_indices=(0,), execution_plan=plan,
+                        metadata=dict(observation.metadata, chunk_id=f"warmup-active-{index}"))
+                    prediction = self.predict(active, _calibration_only=True)
+                    if prediction.positions is None or not prediction.log_data["rtc"].get("used"):
+                        raise ValueError("Warmup did not execute an active RTC prior")
+                    rows.append(prediction.log_data["rtc"]["sampler"])
+                for row in rows:
+                    row = dict(row, path_scope="bootstrap" if row["effective_mode"] == "none" else "active_prior",
+                               warmup_round=index, prior_source="local normalized center; not executor adoption")
+                    self.warmup_trace.append(row)
+                    if self.rtc is not None:
+                        durations.setdefault(row["calibration_key"], []).append(row["elapsed_ms"] * 1e6)
+            for key, samples in durations.items():
+                selected = samples[max(1, len(samples)//2):] if len(samples) > 1 else samples
+                self.rtc.seed_calibration(key, selected)
+                for row in self.warmup_trace:
+                    if row["calibration_key"] == key:
+                        row.update(calibration_sample_count=len(selected),
+                                   calibration_scope="latter warm samples" if len(samples)>1 else "single cold sample")
         finally:
             self.reset("warmup")
 
-    def predict(self, observation):
+    def predict(self, observation, *, _calibration_only=False):
         if self.policy is None:
             raise RuntimeError("Backend is closed")
+        started_perf_ns = time.perf_counter_ns()
         started_ns = time.time_ns()
         index = observation.current_index()
         if observation.qpos.ndim != 2 or observation.qpos.shape[1] != 16:
@@ -148,7 +185,7 @@ class OpenArmBackend(Backend):
         options = {"session_ids": ["openarm"]}
         execution, rtc_log = None, {"mode": "none", "used": False}
         if self.rtc is not None:
-            prepared = self.rtc.prepare(observation, started_ns)
+            prepared = self.rtc.prepare(observation, started_ns, calibration_only=_calibration_only)
             if prepared.reset_native:
                 self.policy.reset()
             if prepared.skip:
@@ -156,7 +193,7 @@ class OpenArmBackend(Backend):
             options.update(prepared.options)
             execution, rtc_log = prepared.execution, prepared.log_data
         started = time.perf_counter()
-        actions, _ = self.policy.get_action(native, options=options)
+        actions, info = self.policy.get_action(native, options=options)
         parts = []
         for key, width in zip(GROUPS, DIMS):
             part = np.asarray(actions[key], dtype=np.float32)
@@ -165,6 +202,15 @@ class OpenArmBackend(Backend):
             parts.append(part[0])
         # Native decode_action already denormalizes and adds raw state to relative arms.
         positions = np.concatenate(parts, axis=-1)
+        elapsed_ns = time.perf_counter_ns() - started_perf_ns
+        trace = info.get("rtc", {})
+        if self.rtc is not None:
+            expected_mode = self.rtc.mode if rtc_log.get("used") else "none"
+            trace = self.rtc.record_prediction(observation, started_ns, elapsed_ns, trace, expected_mode)
+        else:
+            trace = dict(trace, elapsed_ms=elapsed_ns/1e6)
+        trace = dict(trace, calibration_only=bool(_calibration_only))
+        rtc_log = dict(rtc_log, sampler=trace)
         return Prediction(
             positions=positions, interval_ns=INTERVAL_NS,
             execution=execution,

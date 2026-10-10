@@ -1,4 +1,4 @@
-"""Executor-aligned native Jacobian guidance, with no hard-prefix guarantee.
+"""Executor-aligned guided and gradient-free prior conditioning.
 
 The caller owns windows/ACKs. This adapter only snapshots absolute adopted plans,
 aligns their time grid and encodes them through the checkpoint's native processor.
@@ -6,6 +6,7 @@ Training/state normalization and native output-decoder clipping are unchanged.
 """
 
 from copy import copy
+from collections import OrderedDict
 from dataclasses import dataclass, field
 import math
 
@@ -24,6 +25,7 @@ class PriorCodec:
 
     def __init__(self, policy):
         self.tag = policy.embodiment_tag.value
+        self.native_sap = policy.processor.state_action_processor
         self.sap = copy(policy.processor.state_action_processor)
         self.sap.clip_outliers = False
         self.dim = int(policy.model.action_model.action_dim)
@@ -75,6 +77,30 @@ class PriorCodec:
                 result[:, section] += current[section]
         return result
 
+    def validate_inpaint(self, target, current, prefix_len, ramp_steps=0):
+        """Reject frozen values that native output clipping cannot preserve.
+
+        The first linear-ramp point also has zero update strength. This FP32
+        preflight is not an exact decoded BF16 equality guarantee: quantization
+        remains and is measured separately, without changing native decoding.
+        """
+        frozen = int(prefix_len) + bool(ramp_steps)
+        if not 1 <= frozen <= HORIZON:
+            raise ValueError("Invalid inpaint frozen region")
+        real = np.asarray(target, dtype=np.float32)[0, :frozen, :16]
+        if not np.isfinite(real).all() or np.any(np.abs(real) > 1):
+            raise ValueError("Inpaint frozen prior is outside native decoder [-1,1] bounds")
+        groups = {key: np.asarray(target)[0, :, section] for key, section in zip(GROUPS, SLICES)}
+        state = {key: np.asarray(current)[section][None] for key, section in zip(GROUPS, SLICES)}
+        decoded = self.native_sap.unapply_action(groups, self.tag, state=state)
+        decoded = np.concatenate([decoded[key] for key in GROUPS], axis=-1)
+        expected = self.decode_unclipped(target, current)
+        error = float(np.abs(decoded[:frozen] - expected[:frozen]).max())
+        if not np.allclose(decoded[:frozen], expected[:frozen], rtol=2e-5, atol=2e-5):
+            raise ValueError("Inpaint frozen prior is not preserved by native output decoding")
+        return {"frozen_decode_fp32_error": error,
+                "decoded_prefix_scope": "native BF16 quantization; no output replacement"}
+
 
 @dataclass
 class RTCRequest:
@@ -86,34 +112,122 @@ class RTCRequest:
 
 
 class ExecutionRTC:
-    """One accepted plan + predecessor; synchronous single-session Backend use.
+    """Bounded episode state and separate effective-path latency calibration."""
 
-    Guidance weight is 1 on [0,F), native exponential taper on [F,16), and
-    zero on [16,32). Even weight 1 is soft attraction, not hard inpainting.
-    Delays F>16 are unsupported by native d<=s<=H-d and are skipped explicitly.
-    A finished adopted plan holds its last command, matching the executor.
-    """
+    MAX_SAMPLES = 32
+    MAX_CALIBRATIONS = 8
 
-    def __init__(self, policy, *, margin_ms=10, max_lateness_ms=50):
+    def __init__(self, policy, *, mode="guided", guidance_steps=None,
+                 inpaint_ramp_steps=0, margin_ms=10, max_lateness_ms=50):
         if (not math.isfinite(margin_ms) or margin_ms < 0
                 or not math.isfinite(max_lateness_ms) or max_lateness_ms < 0):
             raise ValueError("RTC margins must be finite and nonnegative")
         if (policy.rtc_inference_mode != "guided" or policy.rtc_exec_horizon != 16
                 or policy.rtc_inference_delay != 1):
             raise ValueError("Executor RTC requires native guided mode, delay=1, exec_horizon=16")
+        if mode not in ("guided", "inpaint"):
+            raise ValueError("Executor RTC supports guided or inpaint")
+        head = policy.model.action_model
+        custom = getattr(head, "denoising_timesteps", None)
+        self.denoising_steps = len(custom) if custom is not None else int(head.num_inference_timesteps)
+        default_guidance = head._rtc.jacobian_steps_only
+        effective = default_guidance if guidance_steps is None else guidance_steps
+        effective = self.denoising_steps if effective is None else effective
+        if isinstance(effective, bool) or not isinstance(effective, int) or not 1 <= effective <= self.denoising_steps:
+            raise ValueError("guidance_steps must be within the actual denoising step count")
+        if (isinstance(inpaint_ramp_steps, bool) or not isinstance(inpaint_ramp_steps, int)
+                or not 0 <= inpaint_ramp_steps < HORIZON):
+            raise ValueError("inpaint_ramp_steps must be an integer in [0,31]")
+        if mode == "guided" and inpaint_ramp_steps:
+            raise ValueError("inpaint_ramp_steps applies only to inpaint")
+        self.mode, self.guidance_steps = mode, effective
+        self.inpaint_ramp_steps = inpaint_ramp_steps
+        self.backend_key = (str(policy.model.device),
+                            str(getattr(policy.model.config, "_attn_implementation", "sdpa")),
+                            tuple(custom) if custom is not None else None,
+                            float(getattr(head._rtc, "jacobian_beta", 5.0)))
         self.codec = PriorCodec(policy)
         self.margin_ns = int(margin_ms * 1e6)
         self.max_lateness_ns = int(max_lateness_ms * 1e6)
-        self.delay_ns = 0.0
+        self.latencies_ns = OrderedDict()
+        self.active_key = None
         self.reset()
 
-    def reset(self):
+    @property
+    def delay_ns(self):
+        return self.latencies_ns.get(self.active_key, 0.0)
+
+    def reset(self, *, clear_calibration=False):
         self.plan = self.previous_plan = None
         self.context = None
-        self.last_sample = None
         self.latest_receipt = -1
         self.boundary_ns = None
-        self.delay_ns = 0.0
+        self.pending = OrderedDict()
+        self.acknowledged = OrderedDict()
+        if clear_calibration:
+            self.latencies_ns.clear()
+
+    def path_key(self, observation, mode):
+        shapes = tuple((key, tuple(value.shape[1:])) for key, value in sorted(observation.cameras.items()))
+        settings = (mode, self.denoising_steps,
+                    self.guidance_steps if mode == "guided" else 0,
+                    self.inpaint_ramp_steps if mode == "inpaint" else 0,
+                    self.backend_key, shapes)
+        return repr(settings)
+
+    @staticmethod
+    def _put_bounded(mapping, key, value, limit):
+        mapping[key] = value
+        mapping.move_to_end(key)
+        while len(mapping) > limit:
+            mapping.popitem(last=False)
+
+    def _calibrate(self, key, elapsed, *, replace=False):
+        old = self.latencies_ns.get(key)
+        value = float(elapsed) if old is None or replace else .9 * old + .1 * elapsed
+        self._put_bounded(self.latencies_ns, key, value, self.MAX_CALIBRATIONS)
+
+    def latency_snapshot(self):
+        return {key: value / 1e6 for key, value in self.latencies_ns.items()}
+
+    def seed_calibration(self, key, samples_ns):
+        if not samples_ns or any(not math.isfinite(x) or x <= 0 for x in samples_ns):
+            raise ValueError("Warmup calibration requires finite positive measured durations")
+        self._calibrate(key, float(np.median(samples_ns)), replace=True)
+
+    def record_prediction(self, observation, started_ns, elapsed_ns, trace, expected_mode):
+        """Associate actual execution with caller identity; no guessed feedback mode."""
+        expected_vjp = self.guidance_steps if expected_mode == "guided" else 0
+        if (trace.get("effective_mode") != expected_mode or trace.get("vjp_calls") != expected_vjp
+                or trace.get("denoising_steps") != self.denoising_steps):
+            raise ValueError("Native RTC effective path/VJP count differs from requested execution")
+        key = self.path_key(observation, expected_mode)
+        sample_id = observation.metadata.get("chunk_id")
+        if isinstance(sample_id, str) and sample_id:
+            if sample_id in self.pending or sample_id in self.acknowledged:
+                raise ValueError("Caller chunk_id was reused within an RTC episode")
+            self._put_bounded(self.pending, sample_id, (int(started_ns), key), self.MAX_SAMPLES)
+        if not math.isfinite(elapsed_ns) or elapsed_ns <= 0:
+            raise ValueError("Local compute timing requires a positive monotonic duration")
+        return dict(trace, calibration_key=key, elapsed_ms=elapsed_ns/1e6)
+
+    def _acknowledge(self, plan):
+        sample_id = plan.get("sample_chunk_id")
+        if not isinstance(sample_id, str) or not sample_id:
+            return "missing_sample_identity"
+        start, received = int(plan.get("inference_started_timestamp_ns", 0)), int(plan.get("received_timestamp_ns", 0))
+        entry = self.pending.get(sample_id) or self.acknowledged.get(sample_id)
+        if entry is None:
+            return "untracked_sample_identity"
+        if entry[0] != start:
+            return "sample_start_mismatch"
+        if sample_id in self.acknowledged and entry[2] != received:
+            return "sample_receipt_mismatch"
+        if sample_id in self.pending:
+            self._calibrate(entry[1], received-start)
+            self.pending.pop(sample_id)
+            self._put_bounded(self.acknowledged, sample_id, (*entry, received), self.MAX_SAMPLES)
+        return None
 
     @staticmethod
     def snapshot(plan):
@@ -137,7 +251,7 @@ class ExecutionRTC:
         source = np.arange(len(points), dtype=np.int64) * plan["interval_ns"]
         return np.stack([np.interp(relative, source, column) for column in points.T], -1).astype(np.float32)
 
-    def prepare(self, observation, started_ns):
+    def prepare(self, observation, started_ns, *, calibration_only=False):
         meta = observation.metadata
         context = (observation.prompt, meta.get("inference_trial_id"), meta.get("episode_attempt_id"))
         changed = self.context != context or bool(meta.get("execution_restart"))
@@ -145,12 +259,16 @@ class ExecutionRTC:
             self.reset()
             self.context = context
             self.boundary_ns = int(started_ns)
+        self.active_key = self.path_key(observation, self.mode)
         origin = int(observation.timestamp)
         if origin <= 0 or started_ns < origin:
             raise ValueError("RTC requires positive observation timestamps not later than inference start")
         result = RTCRequest(reset_native=changed)
-        result.log_data = dict(source="executor", mode="guided", hard_prefix=False,
-                               used=False, reason="bootstrap", delay_ms=self.delay_ns / 1e6)
+        result.log_data = dict(source="executor", mode=self.mode, hard_prefix=self.mode == "inpaint",
+                               used=False, reason="bootstrap",
+                               delay_ms=self.delay_ns / 1e6 if self.active_key in self.latencies_ns else None,
+                               calibration_key=self.active_key, calibrated=self.active_key in self.latencies_ns,
+                               calibration_only=bool(calibration_only))
         result.execution = dict(action_window_start=0, action_origin_timestamp_ns=0,
                                 takeover_timestamp_ns=0, based_on_chunk_id="",
                                 inference_started_timestamp_ns=int(started_ns),
@@ -161,11 +279,13 @@ class ExecutionRTC:
         # empty chunk/positions acknowledgement when no plan has been adopted.
         # It withdraws any stored coverage; never reuse it as a predecessor.
         raw_plan = observation.execution_plan
-        if raw_plan.get("chunk_id") == "" and len(raw_plan.get("positions", [])) == 0:
+        withdrawn = raw_plan.get("chunk_id") == "" and len(raw_plan.get("positions", [])) == 0
+        if withdrawn:
             self.plan = self.previous_plan = None
             result.log_data["reason"] = "no_adopted_plan"
-            return result
-        plan = self.snapshot(raw_plan)
+            if not raw_plan.get("sample_chunk_id"):
+                return result
+        plan = raw_plan if withdrawn else self.snapshot(raw_plan)
         sample_start = int(plan.get("inference_started_timestamp_ns", 0))
         received = int(plan.get("received_timestamp_ns", 0))
         sample_id = plan.get("sample_chunk_id")
@@ -175,25 +295,34 @@ class ExecutionRTC:
             reason = "missing_sample_identity"
         elif plan_attempt is not None and plan_attempt != context[2]:
             reason = "attempt_mismatch"
-        elif sample_start < self.boundary_ns or received < sample_start or received > started_ns:
+        elif sample_start < self.boundary_ns or received <= sample_start or received > started_ns:
             reason = "stale_or_invalid_plan_timing"
         elif received < self.latest_receipt:
             reason = "superseded_plan"
+        if reason is None:
+            reason = self._acknowledge(plan)
         if reason:
             result.skip, result.execution = True, None
             result.log_data["reason"] = reason
             return result
         self.latest_receipt = received
-        if sample_id != self.last_sample:
-            elapsed = received - sample_start
-            self.delay_ns = .9 * self.delay_ns + .1 * elapsed if self.delay_ns else float(elapsed)
-            self.last_sample = sample_id
-        result.log_data["delay_ms"] = self.delay_ns / 1e6
+        calibrated = self.active_key in self.latencies_ns
+        result.log_data.update(calibrated=calibrated,
+                               delay_ms=self.delay_ns / 1e6 if calibrated else None)
+        if withdrawn:
+            return result
+        # Only discarded local warmup may exercise an as-yet unmeasured active
+        # path. Live requests cannot schedule a prefix using unknown latency.
+        if not calibrated and not calibration_only:
+            result.skip, result.execution = True, None
+            result.log_data["reason"] = "latency_uncalibrated"
+            return result
         prefix = max(1, math.ceil((started_ns - origin + self.delay_ns + self.margin_ns) / INTERVAL_NS),
                      int(meta.get("rtc_frozen_steps", 0)))
-        if prefix > GUIDANCE_END:
+        limit = GUIDANCE_END if self.mode == "guided" else min(HORIZON-1, HORIZON-self.inpaint_ramp_steps)
+        if prefix > limit:
             result.skip, result.execution = True, None
-            result.log_data.update(reason="delay_exceeds_native_guided_limit", prefix_steps=prefix)
+            result.log_data.update(reason=f"delay_exceeds_native_{self.mode}_limit", prefix_steps=prefix)
             return result
         if self.plan is None or self.plan["chunk_id"] != plan["chunk_id"]:
             self.previous_plan, self.plan = self.plan, plan
@@ -212,12 +341,23 @@ class ExecutionRTC:
         targets[~before] = self.sample(plan, timestamps[~before])
         current = observation.qpos[observation.current_index()]
         target, mask = self.codec.encode(targets, current)
-        result.options = {"executor_rtc": {"target": target, "mask": mask, "prefix_len": prefix}}
+        if self.mode == "inpaint":
+            try:
+                result.log_data.update(self.codec.validate_inpaint(target, current, prefix, self.inpaint_ramp_steps))
+            except ValueError as error:
+                result.skip, result.execution = True, None
+                result.log_data.update(reason="inpaint_prior_not_preservable", detail=str(error))
+                return result
+        result.options = {"executor_rtc": {"target": target, "mask": mask, "prefix_len": prefix,
+                           "mode": self.mode, "guidance_steps": self.guidance_steps if self.mode == "guided" else None,
+                           "ramp_steps": self.inpaint_ramp_steps}}
         result.execution.update(action_window_start=prefix, action_origin_timestamp_ns=origin,
                                 takeover_timestamp_ns=origin + prefix * INTERVAL_NS,
                                 based_on_chunk_id=plan["chunk_id"])
         held = timestamps > plan["start_timestamp_ns"] + (len(plan["positions"]) - 1) * plan["interval_ns"]
-        result.log_data.update(used=True, reason="guided", prefix_steps=prefix,
-                               ramp_steps=GUIDANCE_END-prefix, guidance_end=GUIDANCE_END,
-                               held_endpoint_steps=int(held.sum()), delay_ms=self.delay_ns / 1e6)
+        result.log_data.update(used=True, reason=self.mode, prefix_steps=prefix,
+                               ramp_steps=GUIDANCE_END-prefix if self.mode == "guided" else self.inpaint_ramp_steps,
+                               guidance_end=GUIDANCE_END if self.mode == "guided" else prefix+self.inpaint_ramp_steps,
+                               held_endpoint_steps=int(held.sum()),
+                               delay_ms=self.delay_ns / 1e6 if calibrated else None)
         return result

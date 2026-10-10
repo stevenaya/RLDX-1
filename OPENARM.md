@@ -24,6 +24,14 @@ model-lab `runs/rldx1-pillow500-20261009/`, including
 `formal-1-training-evidence.json`, `formal-1-checkpoint-500-save-completion.json`
 and `formal-reload-evidence.json`.
 
+The 2026-10-10 follow-up adds separate inpaint sampling, guidance-step selection
+and active-prior warmup with mode-specific timing calibration. These changes
+reuse the same checkpoint. CPU regressions, native GPU comparisons and final
+ordinary/inpaint/guided SHM checks passed, including one calibrated receipt per
+RTC mode at the unchanged 10 ms margin and 50 ms lateness. The support matrix
+below separates these short probes from the historical acceptance evidence.
+Follow-up evidence belongs in model-lab `runs/rldx1-rtc-modes-20261010/`.
+
 The scoped SDPA fix preserves the original 4D mask for single-frame identity
 token selection and passed CPU numerical tests plus real GPU training. Genuine
 4D-mask video/motion compression remains unsupported. Effective batch 4 is a
@@ -36,7 +44,7 @@ The checkpoint directory must contain the native HF model/config, its own
 override is accepted. The loader uses `GENERAL_EMBODIMENT` and validates the
 loaded processor's four cameras, joint groups, dimensions and representations.
 It rejects history, memory, motion and physics. Ordinary inference is the
-default; optional executor-guided RTC has the experimental scope below.
+default; optional guided and inpaint RTC have the experimental scope below.
 
 Inputs select `Observation.current_index()`, then pass one RGB uint8 frame per
 camera to the native processor in this order: wrist_right, wrist_left, ceiling,
@@ -105,13 +113,13 @@ RNG, trainer state and other training-resume artifacts. It is an inference bundl
 not a training-resume checkpoint. `formal-manifest-inventory.json` records the
 selection evidence; no downloader transfer receipt exists yet.
 
-The recorded eval-main baseline `7cbe6d22c726a15c8a278b80b7e2e66246236750` lacks
-the downloader engine. The commands below follow its reviewed
-`b70754080df8736f3c150359c302531305138d78` README and remain pending until the
-user brings that engine into an eval checkout containing this manifest. This
-adaptation did not merge or copy the engine. Run these from that eval checkout
-on the inference machine, using an environment with Python 3.10+ and PyYAML,
-plus Bash, SSH and rsync with `--protect-args` support:
+The original eval-main baseline `7cbe6d22c726a15c8a278b80b7e2e66246236750` lacked
+the downloader engine. The user's separately authorized download-only merge
+has since brought it into the maintained integration checkout. The local
+`--latest --dry-run` verified step 500, its marker and all 22 selected files on
+2026-10-10 (Asia/Tokyo); actual weight transfer remains untested. Run the commands
+below from that eval checkout on the inference machine, using Python 3.10+ with
+PyYAML, Bash, SSH and rsync with `--protect-args` support:
 
 ```bash
 # Offline catalog, then remote candidates for this run.
@@ -135,12 +143,16 @@ source namespace; it does not rewrite paths. The expected destination is
 to set YAML `assets_dir` to that bundle and `checkpoint_dir` to its `checkpoint/`
 subdirectory. The engine validates the selected file set and writes
 `.download-receipt.json`; it does not edit experiment YAML or prove GPU inference.
-Catalog execution, engine dry-run and actual checkpoint transfer are untested here.
+Source inventory/dry-run evidence is separate from a destination transfer
+receipt. No actual checkpoint transfer is claimed here.
 
 Warmup uses a local recorded NPZ, not robot execution. It contains `qpos` float32
 `[16]`, four `camera_<key>` uint8 RGB `[height,width,3]` arrays, and optionally a
-scalar Unicode `prompt`. Keep this private sample out of Git and prepare/transfer
-it explicitly on the inference machine. Store it **outside the validated download
+scalar Unicode `prompt`. Match deployment camera sizes, state and task prompt;
+prompt/token-length changes can change runtime even when camera sizes match.
+The NPZ prompt takes precedence; `--prompt` is only a fallback when the NPZ has
+no prompt. Keep this private sample out of Git and prepare/transfer it explicitly
+on the inference machine. Store it **outside the validated download
 bundle**: adding an undeclared file there would change the engine's validated
 file set. For the acceptance's existing validation sample, this example transfers
 exactly one private file through the verified SSH alias; it does not transfer
@@ -160,10 +172,22 @@ chmod 600 "$warmup_dir/warmup-validation-private.npz"
 Set YAML `warmup_sample` to
 `/hdd_data/openarm-private/rldx1-pillow500/warmup-validation-private.npz` explicitly.
 This one-file transfer is guidance, not an executed transfer receipt. The sample
-itself is never published. All warmup output is discarded and the
-native policy session registry is reset before socket readiness is available.
+itself is never published. All warmup output is discarded and the native policy
+registry plus synthetic plan/episode identities are cleared before socket
+readiness. Mode-specific latency calibration survives that cleanup. For RTC,
+each warmup round includes both bootstrap and an active simulated prior;
+`--warmup-steps 2` therefore executes four sampler calls. Ordinary mode executes
+one call per round. Warmup timing uses the latter half of each path's samples,
+excluding its first when there is more than one; two rounds provide only one
+calibration sample per path. A single round is labeled a single cold sample.
 `--warmup-steps 0` explicitly skips warmup; readiness then guarantees load only,
-and the first request can incur additional initialization latency.
+with no active-path calibration. Ordinary bootstrap remains available, but an
+adopted-prior RTC request is skipped with `latency_uncalibrated` until its matching
+active path is calibrated. Changed camera shapes can cause the same explicit skip;
+restart with a representative warmup sample. Only discarded local warmup calls
+use the internal `calibration_only` path; socket metadata cannot enable it.
+The first request can incur additional initialization latency. These small warmup samples do not establish sustained
+latency percentiles.
 
 ```bash
 # In the already provisioned model environment, with eval runtime importable:
@@ -176,7 +200,8 @@ python openarm/serve.py --checkpoint-dir /models/rldx1/checkpoint \
   --socket-path /dev/shm/rldx1-pillow500.socket --torch-num-threads 2
 
 # CPU/mock tests run in the isolated model environment/job:
-python -m unittest openarm.test_backend openarm.test_local_assets openarm.test_rtc -v
+python -m unittest openarm.test_backend openarm.test_local_assets openarm.test_rtc \
+  openarm.test_rtc_sampler_modes openarm.test_check_rtc_modes -v
 ```
 
 `--checkpoint-dir` must be a local export; Hub download/credential resolution is
@@ -202,45 +227,146 @@ RNG was uncontrolled for those calls; repeated outputs need not match. See
 
 ## RTC assessment
 
-`--rtc-mode none` preserves ordinary native sampling and ignores plan feedback.
-`--rtc-mode guided` opts into model-local executor-aligned Jacobian guidance.
-It needs `actions-executor/execution_plan` wired to `policy-server/execution_plan`
-and the current shared caller's pending-plan acknowledgement protocol. It returns
-full trajectories with timing metadata; the caller still selects windows.
-`trained` and `executor` mode values are rejected: this acceptance has no RTC
-training signal, and executor names a feedback source rather than a sampler.
+The 2026-10-10 implementation has the following scope. CPU job 12546 passed all
+59 tests, including missing/changed-shape calibration and actual processor checks
+without weights. GPU job 12544 passed 37 calls on the existing checkpoint-500;
+12545 passed ordinary/inpaint SHM. Final job 12547 passed ordinary/inpaint/guided
+serving after the calibration-miss guard. Historical receipts below retain their
+original scope. Training and the checkpoint are unchanged.
 
-The helper snapshots adopted absolute command plans, samples them on the current
-observation's 30 Hz grid, rebases arms against current raw state and uses the
-checkpoint's native normalization parameters. Its copied prior encoder disables
-clipping only for conditioning; training/state normalization is unchanged. The
-new explicit native `executor_rtc` option injects full normalized targets and
-a boolean mask for 16 real channels. It bypasses legacy model-chunk caches,
-including an explicit `None` bootstrap. Padded channels contribute no direct
-guidance residual. This uses the existing native sampler with one optional mask.
+| Capability | Status and limits |
+| --- | --- |
+| `none` | Default ordinary native sampling. Full server context and four finite `[32,16]` SHM responses passed in each of 12545/12547. |
+| `guided` | Actual 1/3/4 VJPs out of four denoise steps verified in 12544; omitted count matched native 3 exactly. One calibrated guided3 SHM deadline passed in 12547. Prefix remains soft. |
+| `inpaint` | R0/R12 numerics and active warmup passed in 12544. R12 prediction-derived priors and recorded deadlines passed in 12545/12547; inference-only conditioning. |
+| Active-prior warmup | Actual branch/VJP traces verified, including the final guard revision. Synthetic state clears while separate calibration survives. |
+| Mode-specific timing | Separate estimates verified; missing/changed-shape calibration rejects in CPU tests. No sustained deadline or real executor-adoption claim. |
+| `trained`, `executor` | Rejected. This checkpoint has no positive training RTC delay; executor is a feedback source, not a sampler. |
+| Dora graph, robot/task quality | Untested. The recorded SHM harness bypasses outer bridge pending-ACK/admission. |
 
-Native output decoding still clips min-max outputs. Guided sampling attracts
-the prefix through a VJP; it does not hard-inpaint it. Thus even a lossless prior
-encoding does not promise identical output prefix targets or handoff continuity.
-This differs from upstream inference documentation's “hard-fixing” description.
+Both RTC modes need `actions-executor/execution_plan` wired to
+`policy-server/execution_plan` and the shared caller's acknowledgement protocol.
+The helper samples adopted absolute commands on the current observation's 30 Hz
+grid, rebases arms against current raw state, and applies checkpoint statistics.
+Short plans hold their last target. The scoped prior encoder disables clipping
+for conditioning; training/state normalization and native output decoding are
+unchanged. An explicit target and mask cover the 16 real command channels;
+padded channels contribute no direct guidance residual or inpaint constraint.
+Missing plans bootstrap without cached-model-chunk fallback. The backend always
+returns the full trajectory; caller windows and executor adoption remain outside it.
 
-The native convention advances tau from 0 to 1. With horizon 32 and fixed native
-execution horizon 16, guidance weight is 1 on `[0,F)`, tapers exponentially on
-`[F,16)`, and is zero on `[16,32)`. Here F is derived from observation age plus
-receipt-latency EWMA and `--rtc-margin-ms` (default 10 ms). `--rtc-max-lateness-ms`
-(default 50 ms) controls timed-handoff tolerance. Both values must be finite and
-nonnegative. There is no configurable ramp or compilation option.
+`guided` advances the native tau 0→1 schedule and applies soft attraction with
+weight 1 on `[0,F)`, exponential taper on `[F,16)`, and zero on `[16,32)`.
+It does not hard-freeze the prefix. `--rtc-guidance-steps` selects 1..4 VJP steps
+out of this checkpoint's four denoising steps. Omitting it preserves the native
+checkpoint setting, currently 3. This option is accepted only with guided mode.
+More guidance work or smaller prior error does not establish better task quality.
 
-F greater than 16 skips inference explicitly; the implementation does not
-shorten measured latency to force a result. An excessive EWMA may keep skipping;
-a fresh valid sample acknowledgement can update it, and an explicit
-reset/restart clears it immediately. Automatic probe-based recovery is not
-implemented. Short adopted plans hold their last target, matching executor
-behavior. Missing feedback cold-bootstraps without model-cache fallback; stale
-or mismatched-attempt feedback is skipped. Prompt/trial/attempt changes and
-reset/disconnect clear both native and helper state. Warmup uses no executor
-plan and clears helper state afterward; its readiness does not prove the first
-guided VJP has already been exercised.
+`inpaint` injects the normalized prior into masked prefix and ramp positions.
+Euler update strength is 0 on `[0,F)`, `j/R` at ramp offset `j=0..R-1`, and 1
+afterward and on padded channels. Thus the first ramp point is also frozen.
+`--rtc-inpaint-ramp-steps R` defaults to 0 and accepts 0..31 only with inpaint mode;
+the current prefix plus ramp must fit horizon 32. This preserves the native
+token times; it does not force clean-prefix `t=1` or claim trained RTC support.
+The normalized frozen target is BF16-quantized. Exact FP32 absolute-prefix
+equality is not promised: checkpoint scaling can amplify quantization error.
+In 12544, F4 frozen normalized values and every Euler update matched exactly;
+the decoded prefix differed from its original FP32 absolute prior by at most
+0.000283063 rad. R12 ramp/free output clipping changed values by up to 0.095555/
+0.106172 rad relative to the unclipped inverse. A synthetic +10 rad rebase was
+rejected; native clipping would have moved its frozen target by up to 9.897142 rad.
+
+Native output decoding still clips min-max outputs. Inpaint rejects a frozen
+prefix that cannot survive that decoder, including the first zero-strength
+ramp point, and returns no commands for that request. Out-of-range rebased
+targets are not silently accepted as an exact absolute prefix. Decoder ranges
+are normalization statistics, not actuator safety bounds. Guided is soft and
+may produce different decoded prefix targets even with lossless prior encoding.
+
+The scheduling prefix F includes observation age, the matching active-path
+latency estimate and `--rtc-margin-ms` (default 10 ms). Guided requires F<=16;
+inpaint requires F<=min(31,32-R). Unsupported delays skip without shortening the
+estimate. `--rtc-max-lateness-ms` stays 50 ms by default; increasing scheduling
+margin moves takeover later and can lengthen the constrained prefix, without
+accelerating the model or relaxing lateness. Automatic recovery probes are not
+implemented.
+
+Warmup runs representative recorded images/state/prompt through bootstrap and
+the selected active-prior path, using a local simulated normalized-center plan.
+The server logs `Warmup paths` and `Mode latency calibration ms`; requested mode
+alone is not proof the path ran. It records actual denoising/VJP counts and clears
+synthetic plans, context and identities before readiness. Calibration remains
+separate by effective mode, denoising/guidance/ramp settings, device/native
+configuration and camera shapes. The outer configuration label in a key is not
+an independently measured kernel identity. **Prompt/token length is not part of the calibration
+key**: use a representative matching task prompt, and remeasure for changed
+prompt workloads. Camera-shape equality alone does not establish timing coverage.
+
+Fresh valid acknowledgements update the path that generated the identified
+sample; bootstrap feedback cannot overwrite active guided/inpaint calibration.
+The bounded identity records reject stale, untracked or mismatched feedback.
+Prompt/trial/attempt changes and reset/disconnect clear episode state and native
+caches while retaining path-specific latency calibration. A new process or
+internal `reset(clear_calibration=True)` clears calibration. No estimate guarantees
+the next receipt will meet its deadline.
+
+In an independently provisioned model environment on an authorized inference
+machine, these commands start only a socket server. They are experimental mode
+examples, not recorded test results:
+
+```bash
+# Guided: explicit 3 matches this checkpoint's default; compare 1/3/4 before choosing.
+python openarm/serve.py --checkpoint-dir /models/rldx1/checkpoint \
+  --warmup-sample /private/rldx1/warmup.npz --warmup-steps 2 \
+  --rtc-mode guided --rtc-guidance-steps 3 --rtc-margin-ms 10 \
+  --rtc-max-lateness-ms 50 --socket-path /dev/shm/rldx1-guided.socket
+
+# Inpaint: optional 12-step ramp; omit the flag for default 0.
+python openarm/serve.py --checkpoint-dir /models/rldx1/checkpoint \
+  --warmup-sample /private/rldx1/warmup.npz --warmup-steps 2 \
+  --rtc-mode inpaint --rtc-inpaint-ramp-steps 12 --rtc-margin-ms 10 \
+  --rtc-max-lateness-ms 50 --socket-path /dev/shm/rldx1-inpaint.socket
+```
+
+The one-load `openarm.check_rtc_modes` harness compares ordinary, inpaint with
+and without a ramp, and guided 1/3/4 at matched inputs/RNG and total 4 denoising
+steps. It records per-step normalized and decoded errors, real/padded-mask
+behavior, clipping rejection, VJP traces, timing/memory and production warmup.
+Instrumentation and earlier settings can warm shared kernels; its first/repeat
+samples are not a sustained benchmark. Execute it only in a registered bounded
+model job. Its ordinary control uses a guided-configured policy with no prior
+and `no_grad`; the full ordinary server's `inference_mode` path was checked
+separately over SHM. Original logs, exact timestamps and measured limits are in
+model-lab `runs/rldx1-rtc-modes-20261010/`.
+
+The matched-input/RNG instrumented pipeline repeats measured 154.648 ms for
+inpaint R0, 164.273 ms for R12, and 191.544/239.175/260.938 ms for guided 1/3/4.
+There were only two samples per setting, in fixed order; earlier calls could
+warm shared kernels. The first ordinary control took 4982.050 ms, including
+680.489 ms preprocessing and 4300.638 ms native work. These are whole-path
+measurements, not isolated backward-kernel costs. The fourth VJP at tau 0.75
+was nonzero (maximum 0.0966796875); three guidance steps are a retained native
+baseline, not a universal optimum. No preset is preferred from these timings
+or its error to a single prior.
+
+Final job 12547 used two warmup rounds, 10 ms margin and 50 ms lateness:
+
+| Actual server path | Recorded call wall | Active estimate | Prefix / ramp or taper | Receipt before deadline |
+| --- | ---: | ---: | --- | ---: |
+| Ordinary | 154.095–155.862 ms, four calls | Not used | None | Not timed RTC |
+| Inpaint R12 | 157.473 ms, one active call | 152.198 ms | F6 / ramp12 | 85.414 ms |
+| Guided native3 | 239.347 ms, one active call | 233.376 ms | F8 / taper8 | 70.519 ms |
+
+The guided backend-start-to-receipt interval was 237.501 ms, only 4.125 ms
+above its active warmup estimate. Ordinary feedback did not replace that
+estimate. This addresses the previous ordinary-to-guided underestimate below;
+VJP work still costs time after warmup. Both active priors came from actual
+preceding caller-selected predictions and were rebased to changed current state.
+Missing/withdrawn plans, stale rejection, reset/reconnect, SHM release and clean
+shutdown passed. These short offline probes do not establish estimator
+convergence, sustained deadlines, bridge admission or real executor adoption.
+
+### Historical guided evidence before the warmup/calibration rework
 
 Guided checkpoint SHM testing in Slurm job 12534 exercised the native VJP path
 with a rebased adopted-plan target, prefix F=6 and horizon 32, and returned finite
@@ -261,8 +387,9 @@ margin produced F=10, six taper steps and 16 free steps. It returned finite full
 and clean shutdown checks also passed. See `inference-guided-margin150-1.json`
 and `rtc-margin-comparison.json` in the run evidence directory.
 
-The delay estimate initially comes from an unguided bootstrap, while guided
-sampling adds three VJPs. It still underestimated the new guided
+In that historical implementation, warmup had no effective prior and exercised
+no guided VJP. Its delay estimate came from an unguided bootstrap, while guided
+sampling added three VJPs. It still underestimated the follow-up guided
 backend-start-to-receipt duration by 97.423987 ms; the explicit larger margin
 provided enough lead time for this call. The new call also ran faster, native
 RNG was uncontrolled and prefix length differed, so these receipts do not isolate a

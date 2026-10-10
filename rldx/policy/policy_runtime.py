@@ -155,7 +155,7 @@ class PolicyRuntime:
             self.registry.save_rtc_batch(active_sids, normalized_action)
 
         action = self._decode(normalized_action, states)
-        return action, {}
+        return action, {"rtc": model_pred["rtc_trace"]} if "rtc_trace" in model_pred else {}
 
     # ------------------------------------------------------------------
     # Stage 1: prepare inputs
@@ -376,14 +376,28 @@ class PolicyRuntime:
         prior = request.extras["executor_rtc"]
         if prior is None:
             return []  # Explicit bootstrap, even if a native cached chunk exists.
+        mode = prior.get("mode", self.rtc_inference_mode)
+        if mode not in ("guided", "inpaint"):
+            raise ValueError("executor_rtc mode must be guided or inpaint")
         horizon = int(self.model.config.action_horizon)
         dim = int(self.model.action_model.action_dim)
         prefix = prior["prefix_len"]
-        if not isinstance(prefix, int):
+        if type(prefix) is not int:
             raise ValueError("executor_rtc prefix_len must be an integer")
         s = self.rtc_exec_horizon or (horizon - prefix)
-        if not 0 < prefix <= s <= horizon - prefix:
+        if mode == "guided" and not 0 < prefix <= s <= horizon - prefix:
             raise ValueError("executor_rtc requires 0 < prefix <= s <= H-prefix")
+        ramp = prior.get("ramp_steps", 0)
+        if type(ramp) is not int or ramp < 0 or not 0 < prefix <= horizon - ramp:
+            raise ValueError("executor_rtc requires 0 < prefix and 0 <= ramp <= H-prefix")
+        if mode == "guided" and ramp:
+            raise ValueError("ramp_steps is an inpaint-only option")
+        steps = prior.get("guidance_steps")
+        if steps is not None:
+            schedule = getattr(self.model.action_model, "denoising_timesteps", None)
+            total = len(schedule) if schedule is not None else self.model.action_model.num_inference_timesteps
+            if mode != "guided" or type(steps) is not int or not 1 <= steps <= total:
+                raise ValueError("guidance_steps requires guided mode and integer 1..denoising_steps")
         target = torch.as_tensor(prior["target"], device=self.model.device, dtype=torch.float32)
         mask = torch.as_tensor(prior["mask"], device=self.model.device)
         expected = (B, horizon, dim)
@@ -396,6 +410,9 @@ class PolicyRuntime:
         collated["action_postfix_target"] = target[:, prefix:].contiguous()
         collated["rtc_prefix_len"] = prefix
         collated["action_guidance_mask"] = mask
+        collated["rtc_mode"] = mode
+        collated["rtc_guidance_steps"] = steps
+        collated["rtc_ramp_steps"] = ramp
         return []  # Suppress native RTC chunk-cache writes in step().
 
     # ------------------------------------------------------------------
@@ -451,7 +468,7 @@ class PolicyRuntime:
         with (
             self._select_inference_context(
                 self._rtc_enabled,
-                self.rtc_inference_mode,
+                collated.get("rtc_mode", self.rtc_inference_mode),
             ),
             torch.autocast(device_type="cuda", dtype=torch.bfloat16),
         ):

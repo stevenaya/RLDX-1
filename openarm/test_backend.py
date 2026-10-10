@@ -13,6 +13,7 @@ import tempfile
 import threading
 from types import SimpleNamespace as NS
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 from openarm_policy_runtime import ModelSession, Observation, serve_connection
@@ -35,23 +36,35 @@ class FakePolicy:
 
     def __init__(self):
         self.embodiment_tag = Tag.GENERAL_EMBODIMENT
-        self.model = NS(config=NS(action_horizon=32, video_length=1))
+        self.model = NS(config=NS(action_horizon=32, video_length=1), device="cpu",
+                        action_model=NS(action_dim=64, num_inference_timesteps=4,
+                                        _rtc=NS(jacobian_steps_only=3)))
         self.use_memory = False
         self.rtc_inference_mode = "none"
+        self.rtc_inference_delay, self.rtc_exec_horizon = 1, 16
         self.language_key = "annotation.human.action.task_description"
         self.modality_configs = {
             "video": NS(modality_keys=list(CAMERAS), delta_indices=[0]),
             "state": NS(modality_keys=list(GROUPS), delta_indices=[0]),
             "action": NS(modality_keys=list(GROUPS), delta_indices=list(range(32)),
+                         mean_std_embedding_keys=[],
                          action_configs=[NS(rep="relative" if i in (0, 2) else "absolute",
                                             type="non_eef", format="default", state_key=key)
                                          for i, key in enumerate(GROUPS)]),
             "language": NS(modality_keys=[self.language_key], delta_indices=[0]),
         }
-        norms = {kind: {key: {"dim": width} for key, width in zip(GROUPS, DIMS)}
+        norms = {kind: {key: {"dim": width, "min": -np.ones(width), "max": np.ones(width)}
+                        for key, width in zip(GROUPS, DIMS)}
                  for kind in ("state", "action")}
+        def encode(actions, tag, state):
+            return {key: value-state[key] if key.endswith("arm") else value.copy()
+                    for key, value in actions.items()}
+        def decode(actions, tag, state):
+            return {key: np.clip(value, -1, 1)+state[key] if key.endswith("arm") else np.clip(value, -1, 1)
+                    for key, value in actions.items()}
         self.processor = NS(state_action_processor=NS(
-            use_relative_action=True, norm_params={"general_embodiment": norms}))
+            use_relative_action=True, clip_outliers=True, norm_params={"general_embodiment": norms},
+            modality_configs={"general_embodiment": self.modality_configs}, apply_action=encode, unapply_action=decode))
         self.calls, self.reset_count = [], 0
         self.bad_output = False
 
@@ -61,7 +74,13 @@ class FakePolicy:
                    for key, value in observation["state"].items()}
         if self.bad_output:
             actions["right_arm"][0, 2, 1] = np.nan
-        return actions, {}
+        prior = options.get("executor_rtc")
+        mode = prior.get("mode", "guided") if prior is not None else "none"
+        steps = (prior.get("guidance_steps") or 3) if mode == "guided" else 0
+        return actions, {"rtc": dict(effective_mode=mode, vjp_calls=steps, guidance_steps=steps,
+                                      denoising_steps=4, prefix_len=prior["prefix_len"] if prior else 0,
+                                      ramp_steps=prior.get("ramp_steps", 0) if prior else 0,
+                                      timesteps=[0, .25, .5, .75, 1])}
 
     def reset(self):
         self.reset_count += 1
@@ -146,6 +165,14 @@ class BackendTests(unittest.TestCase):
         parsed = parse_args(["--checkpoint-dir", "/nonexistent", "--rtc-mode", "guided",
                              "--warmup-steps", "0"])
         self.assertEqual(parsed.rtc_mode, "guided")
+        parsed = parse_args(["--checkpoint-dir", "/nonexistent", "--rtc-mode", "inpaint",
+                             "--rtc-inpaint-ramp-steps", "2", "--warmup-steps", "0"])
+        self.assertEqual(parsed.rtc_mode, "inpaint")
+        for extra in (["--rtc-mode", "inpaint", "--rtc-guidance-steps", "1"],
+                      ["--rtc-mode", "guided", "--rtc-inpaint-ramp-steps", "2"],
+                      ["--rtc-mode", "guided", "--rtc-guidance-steps", "5"]):
+            with self.assertRaises(SystemExit):
+                parse_args(["--checkpoint-dir", "/nonexistent", "--warmup-steps", "0"]+extra)
         with self.assertRaises(SystemExit):
             parse_args(["--checkpoint-dir", "/nonexistent", "--rtc-margin-ms", "nan",
                         "--warmup-steps", "0"])
@@ -157,13 +184,16 @@ class BackendTests(unittest.TestCase):
         policy.rtc_inference_mode = "guided"
         class FakeRTC:
             def __init__(self):
+                self.mode = "guided"
                 self.resets = 0
                 self.next = RTCRequest(reset_native=True)
-            def prepare(self, obs, started_ns):
+            def prepare(self, obs, started_ns, *, calibration_only=False):
                 self.last_started = started_ns
                 return self.next
             def reset(self):
                 self.resets += 1
+            def record_prediction(self, observation, started_ns, elapsed_ns, trace, expected_mode):
+                return trace
 
         rtc = FakeRTC()
         with self.assertRaisesRegex(ValueError, "explicit executor"):
@@ -177,7 +207,7 @@ class BackendTests(unittest.TestCase):
                   "mask": np.ones((1, 32, 64), dtype=bool)}
         timing = {"based_on_chunk_id": "adopted-1", "action_window_start": 3}
         rtc.next = RTCRequest(options={"executor_rtc": target}, execution=timing,
-                              log_data={"mode": "guided", "hard_prefix": False})
+                              log_data={"mode": "guided", "hard_prefix": False, "used": True})
         guided = backend.predict(observation())
         self.assertEqual(guided.positions.shape, (32, 16))
         self.assertEqual(guided.execution, timing)
@@ -204,6 +234,15 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(first.calls[0][1], {"session_ids": ["openarm"]})
         self.assertIsNone(off.execution)
 
+    def test_local_durations_use_monotonic_clock_despite_wall_clock_change(self):
+        backend = OpenArmBackend(FakePolicy(), manifest())
+        with patch("openarm.backend.time.time_ns", side_effect=[100, 50]), \
+             patch("openarm.backend.time.perf_counter_ns", side_effect=[1000, 12000, 20000, 35000]):
+            first = backend.predict(observation())
+            second = backend.predict(observation())
+        self.assertEqual(first.log_data["rtc"]["sampler"]["elapsed_ms"], .011)
+        self.assertEqual(second.log_data["rtc"]["sampler"]["elapsed_ms"], .015)
+
     def test_warmup_reset_and_close(self):
         policy = FakePolicy()
         with tempfile.TemporaryDirectory() as directory:
@@ -221,6 +260,60 @@ class BackendTests(unittest.TestCase):
             backend.close()  # Idempotent resource release.
             with self.assertRaisesRegex(RuntimeError, "closed"):
                 backend.predict(obs)
+
+    def test_active_warmup_modes_calibration_and_synthetic_state_cleanup(self):
+        from openarm.rtc import ExecutionRTC
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "warmup.npz"
+            obs = observation()
+            np.savez(path, qpos=obs.qpos[0], prompt=np.asarray(obs.prompt),
+                     **{key: value[0] for key, value in obs.cameras.items()})
+            for mode, steps, ramp in (("guided", 1, 0), ("guided", 4, 0), ("inpaint", None, 2)):
+                policy = FakePolicy()
+                policy.rtc_inference_mode = "guided"
+                rtc = ExecutionRTC(policy, mode=mode, guidance_steps=steps, inpaint_ramp_steps=ramp)
+                backend = OpenArmBackend(policy, manifest(), rtc=rtc, warmup_sample=path, warmup_steps=2)
+                backend.warmup()
+                self.assertEqual([row["effective_mode"] for row in backend.warmup_trace], ["none", mode, "none", mode])
+                self.assertEqual([row["vjp_calls"] for row in backend.warmup_trace], [0, steps or 0, 0, steps or 0])
+                self.assertEqual([row["calibration_only"] for row in backend.warmup_trace],
+                                 [False, True, False, True])
+                self.assertTrue(all(row["calibration_sample_count"]==1 for row in backend.warmup_trace))
+                self.assertTrue(all(row["calibration_scope"]=="latter warm samples" for row in backend.warmup_trace))
+                self.assertIsNone(rtc.context)
+                self.assertIsNone(rtc.plan)
+                self.assertIsNone(rtc.previous_plan)
+                self.assertFalse(rtc.pending or rtc.acknowledged)
+                calibration = rtc.latency_snapshot()
+                self.assertEqual(len(calibration), 2)
+                self.assertTrue(all(value > 0 for value in calibration.values()))
+                backend.reset("new-trial")
+                self.assertEqual(calibration, rtc.latency_snapshot())
+
+    def test_active_warmup_single_sample_is_truthful_and_fallback_rejected(self):
+        from openarm.rtc import ExecutionRTC
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "warmup.npz"
+            obs = observation()
+            np.savez(path, qpos=obs.qpos[0], prompt=np.asarray(obs.prompt),
+                     **{key: value[0] for key, value in obs.cameras.items()})
+            policy = FakePolicy()
+            policy.rtc_inference_mode = "guided"
+            rtc = ExecutionRTC(policy)
+            backend = OpenArmBackend(policy, manifest(), rtc=rtc, warmup_sample=path, warmup_steps=1)
+            backend.warmup()
+            self.assertTrue(all(row["calibration_scope"]=="single cold sample" for row in backend.warmup_trace))
+            original = policy.get_action
+            def fallback(native, options):
+                actions, info = original(native, options)
+                info["rtc"].update(effective_mode="none", vjp_calls=0)
+                return actions, info
+            policy.get_action = fallback
+            with self.assertRaisesRegex(ValueError, "effective path/VJP"):
+                backend.warmup()
+            self.assertFalse(rtc.pending or rtc.acknowledged)
 
     def test_real_socket_shm_full_prediction_and_disconnect(self):
         policy = FakePolicy()

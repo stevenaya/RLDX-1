@@ -528,6 +528,8 @@ class RLDXActionModel(nn.Module):
         soft_mask_W = None
         postfix_target = None
         guidance_mask = None
+        guidance_steps = rtc.jacobian_steps_only
+        ramp_steps = 0
         if rtc.enabled_inference() and action_input is not None:
             maybe_prefix = action_input.get("action_prefix", None)
             cfg_len = int(action_input.get("rtc_prefix_len", rtc.inference_delay) or 0)
@@ -547,8 +549,11 @@ class RLDXActionModel(nn.Module):
                 if maybe_prefix.shape[1] >= cfg_len:
                     prefix_actions = maybe_prefix[:, :cfg_len].contiguous()
                     prefix_len = cfg_len
-                    rtc_mode = rtc.inference_mode
-                    if rtc_mode == "guided":
+                    requested_mode = action_input.get("rtc_mode")
+                    if requested_mode is not None and requested_mode not in ("guided", "inpaint"):
+                        raise ValueError(f"invalid per-request RTC mode: {requested_mode}")
+                    rtc_mode = rtc.inference_mode if requested_mode is None else requested_mode
+                    if rtc_mode in ("guided", "inpaint"):
                         # Optional model-local executor adapter mask. Padded or
                         # auxiliary channels must not contribute a VJP residual.
                         # Omitting it preserves native guidance on every channel.
@@ -561,10 +566,21 @@ class RLDXActionModel(nn.Module):
                                 raise ValueError(
                                     "action_guidance_mask must be bool [B,H,action_dim]"
                                 )
-                        s = rtc.inference_exec_horizon or (horizon - prefix_len)
-                        soft_mask_W = compute_soft_mask_weights(
-                            horizon, prefix_len, s, device=device, dtype=dtype
-                        )  # (1, H); will broadcast to (B, H)
+                        if rtc_mode == "guided":
+                            guidance_steps = action_input.get("rtc_guidance_steps", None)
+                            if guidance_steps is None:
+                                guidance_steps = rtc.jacobian_steps_only
+                            s = rtc.inference_exec_horizon or (horizon - prefix_len)
+                            soft_mask_W = compute_soft_mask_weights(
+                                horizon, prefix_len, s, device=device, dtype=dtype
+                            )  # (1, H); will broadcast to (B, H)
+                        else:
+                            ramp_steps = action_input.get("rtc_ramp_steps", 0)
+                            if (type(ramp_steps) is not int or ramp_steps < 0
+                                    or prefix_len + ramp_steps > horizon):
+                                raise ValueError("inpaint requires 0 <= ramp_steps <= H-prefix_len")
+                            if guidance_mask is None:
+                                raise ValueError("inpaint requires an explicit real-action mask")
                         # Optional Y target for the new chunk's [d, H) region —
                         # the previous chunk's predictions sliced to the matching
                         # absolute-time positions (Eq. 5 of arXiv 2506.07339).
@@ -602,8 +618,10 @@ class RLDXActionModel(nn.Module):
             _rtc_parts.append(f"s={_rtc_s}")
             if rtc_mode == "guided":
                 _rtc_parts.append(f"β={rtc.jacobian_beta}")
-                if rtc.jacobian_steps_only is not None:
-                    _rtc_parts.append(f"steps_only={rtc.jacobian_steps_only}")
+                if guidance_steps is not None:
+                    _rtc_parts.append(f"steps_only={guidance_steps}")
+            elif rtc_mode == "inpaint":
+                _rtc_parts.append(f"ramp_steps={ramp_steps}")
         elif rtc.enabled_inference():
             _rtc_parts.append("cold_start=True")  # config wants RTC but no prefix arrived
         _print(f"[RTC] B={batch_size} H={horizon} " + " ".join(_rtc_parts))
@@ -621,6 +639,29 @@ class RLDXActionModel(nn.Module):
         # Trained mode hard-inpaints prefix; guided mode relies on VJP only.
         if rtc_mode == "trained" and prefix_len > 0:
             actions[:, :prefix_len] = prefix_actions
+        velocity_strength = None
+        if rtc_mode == "inpaint":
+            # N1.7's prior injection and rate=0 update ramp, in RLDX's tau 0->1
+            # convention. This is inference-only: never mark prefix tokens t=1.
+            overlap = prefix_len + ramp_steps
+            if ramp_steps and (postfix_target is None or postfix_target.shape[1] < ramp_steps):
+                raise ValueError("inpaint ramp requires matching postfix targets")
+            prior = prefix_actions if not ramp_steps else torch.cat(
+                (prefix_actions, postfix_target[:, :ramp_steps]), dim=1
+            )
+            actions[:, :overlap] = torch.where(
+                guidance_mask[:, :overlap], prior, actions[:, :overlap]
+            )
+            strength = torch.zeros(overlap, device=device, dtype=dtype)
+            if ramp_steps:
+                # The first ramp point remains frozen, as in the N1.7 reference.
+                strength[prefix_len:] = torch.linspace(
+                    0, 1, ramp_steps + 1, device=device, dtype=dtype
+                )[:-1]
+            velocity_strength = torch.ones_like(actions)
+            velocity_strength[:, :overlap] = torch.where(
+                guidance_mask[:, :overlap], strength[None, :, None], 1.0
+            )
 
         # Use custom denoising timesteps if set, otherwise uniform spacing.
         if hasattr(self, "denoising_timesteps") and self.denoising_timesteps is not None:
@@ -628,6 +669,13 @@ class RLDXActionModel(nn.Module):
         else:
             n = self.num_inference_timesteps
             timesteps_list = [t / float(n) for t in range(n)] + [1.0]
+        denoising_steps = len(timesteps_list) - 1
+        requested_steps = action_input.get("rtc_guidance_steps") if action_input is not None else None
+        if requested_steps is not None and (
+            type(requested_steps) is not int or not 1 <= requested_steps <= denoising_steps
+        ):
+            raise ValueError("rtc_guidance_steps must be an integer in 1..denoising_steps")
+        vjp_calls = 0
 
         encoder_attention_mask = backbone_output.get("backbone_attention_mask", None)
         if encoder_attention_mask is not None and encoder_attention_mask.all():
@@ -671,7 +719,7 @@ class RLDXActionModel(nn.Module):
                 actions[:, :prefix_len] = prefix_actions
 
             use_jacobian = rtc_mode == "guided" and (
-                rtc.jacobian_steps_only is None or i < rtc.jacobian_steps_only
+                guidance_steps is None or i < guidance_steps
             )
 
             if use_jacobian:
@@ -720,6 +768,7 @@ class RLDXActionModel(nn.Module):
                         retain_graph=False,
                         create_graph=False,
                     )[0]
+                    vjp_calls += 1
                 c = guidance_scale(t_cont, rtc.jacobian_beta)
                 pred_velocity = (v.detach() + c * vjp.detach()).to(dtype=dtype)
                 if isinstance(mo, dict):
@@ -735,7 +784,10 @@ class RLDXActionModel(nn.Module):
 
             # Euler step.
             with torch.no_grad():
-                actions = actions + dt * pred_velocity
+                if velocity_strength is None:
+                    actions = actions + dt * pred_velocity
+                else:
+                    actions = actions + dt * pred_velocity * velocity_strength
                 # Re-lock prefix between Euler steps (trained mode only).
                 if rtc_mode == "trained" and prefix_len > 0:
                     actions[:, :prefix_len] = prefix_actions
@@ -746,6 +798,15 @@ class RLDXActionModel(nn.Module):
                 "action_pred": actions,
                 "backbone_features": vl_embeds,
                 "state_features": state_features,
+                "rtc_trace": {
+                    "effective_mode": rtc_mode,
+                    "vjp_calls": vjp_calls,
+                    "denoising_steps": denoising_steps,
+                    "guidance_steps": vjp_calls,
+                    "prefix_len": prefix_len,
+                    "ramp_steps": ramp_steps,
+                    "timesteps": [float(t) for t in timesteps_list],
+                },
             }
         )
 
